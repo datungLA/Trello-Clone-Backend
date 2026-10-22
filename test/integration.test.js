@@ -164,8 +164,8 @@ test('expired and revoked invitations, cross-board moves and validation', async 
   const first = await owner.request(`/boards/${firstBoard.id}/lists`, { method: 'POST', status: 201, body: { title: 'First' } });
   const second = await owner.request(`/boards/${secondBoard.id}/lists`, { method: 'POST', status: 201, body: { title: 'Second' } });
   const card = await owner.request(`/lists/${first.id}/cards`, { method: 'POST', status: 201, body: { title: 'Stay here' } });
-  await owner.request(`/cards/${card.id}/move`, { method: 'POST', status: 400, body: { listId: second.id, position: 0 } });
-  assert.equal((await owner.request(`/cards/${card.id}`)).listId, first.id);
+  await owner.request(`/cards/${card.id}/move`, { method: 'POST', body: { listId: second.id, position: 0 } });
+  assert.equal((await owner.request(`/cards/${card.id}`)).listId, second.id);
   await owner.request(`/cards/${card.id}`, { method: 'PATCH', status: 400, body: { archived: 'false' } });
   await owner.request(`/boards/${firstBoard.id}`, { method: 'PATCH', status: 400, body: { color: 'url(evil)' } });
 });
@@ -183,4 +183,146 @@ test('refresh replay after grace revokes every access and refresh token for the 
   await client.request('/auth/me', { status: 401 });
   client.cookies.set('rt', rotatedRefresh);
   await client.request('/auth/renew', { method: 'POST', status: 401, csrf: csrfToken });
+});
+
+
+test('rich card metadata, checklists, comments and saved views preserve authorization', async () => {
+  const owner = await account('tasks-owner'), member = await account('tasks-member'), outsider = await account('tasks-outsider');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Task workspace' } });
+  const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Tasks' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Doing' } });
+  const card = await owner.request(`/lists/${list.id}/cards`, { method: 'POST', status: 201, body: { title: 'Polish interface' } });
+  const label = await owner.request(`/boards/${board.id}/labels`, { method: 'POST', status: 201, body: { name: 'Design', color: '#0079bf' } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { labelIds: [label.id], assigneeIds: [member.user.id], coverColor: '#123456', startDate: '2026-01-01', dueDate: '2026-01-02', completed: true } });
+  await outsider.request(`/cards/${card.id}`, { status: 404 });
+  await outsider.request(`/boards/${board.id}/labels`, { method: 'POST', status: 404, body: { name: 'Hidden', color: '#ffffff' } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', status: 400, body: { assigneeIds: [outsider.user.id] } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', status: 400, body: { startDate: '2027-01-01' } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', status: 400, body: { dueDate: '2026-02-30' } });
+  const checklist = await owner.request(`/cards/${card.id}/checklists`, { method: 'POST', status: 201, body: { title: 'Ship' } });
+  const item = await member.request(`/checklists/${checklist.id}/items`, { method: 'POST', status: 201, body: { title: 'Review' } });
+  const other = await member.request(`/checklists/${checklist.id}/items`, { method: 'POST', status: 201, body: { title: 'Publish' } });
+  await owner.request(`/checklist-items/${other.id}`, { method: 'PATCH', body: { completed: true, position: 0 } });
+  await outsider.request(`/checklist-items/${item.id}`, { method: 'DELETE', status: 404 });
+  const comment = await member.request(`/cards/${card.id}/comments`, { method: 'POST', status: 201, body: { body: 'Ready for review' } });
+  await owner.request(`/comments/${comment.id}`, { method: 'PATCH', status: 403, body: { body: 'Changed' } });
+  await owner.request(`/comments/${comment.id}`, { method: 'DELETE', status: 403 });
+  await member.request(`/comments/${comment.id}`, { method: 'PATCH', body: { body: 'Reviewed' } });
+  let detail = await owner.request(`/cards/${card.id}`);
+  assert.deepEqual(detail.labelIds, [label.id]);
+  assert.deepEqual(detail.assigneeIds, [member.user.id]);
+  assert.equal(detail.completed, true);
+  assert.equal(detail.checklists[0].items[0].id, other.id);
+  assert.equal(detail.checklists[0].items[0].completed, true);
+  assert.equal(detail.comments[0].body, 'Reviewed');
+  assert.ok(detail.activity.some(event => event.action === 'comment.created'));
+  assert.equal((await owner.request(`/boards/${board.id}?due=overdue`)).lists[0].cards.length, 0);
+  assert.equal((await owner.request(`/boards/${board.id}?query=polish&labelId=${label.id}&assigneeId=${member.user.id}&due=completed`)).lists[0].cards.length, 1);
+  const view = await owner.request(`/boards/${board.id}/views`, { method: 'POST', status: 201, body: { name: 'Mine', filters: { query: 'polish', labelIds: [label.id], due: 'completed' } } });
+  assert.equal((await owner.request(`/boards/${board.id}/views`))[0].id, view.id);
+  assert.equal((await member.request(`/boards/${board.id}/views`)).length, 0);
+  await member.request(`/views/${view.id}`, { method: 'DELETE', status: 404 });
+  await owner.request(`/workspaces/${workspace.id}/members/${member.user.id}`, { method: 'DELETE' });
+  detail = await owner.request(`/cards/${card.id}`);
+  assert.deepEqual(detail.assigneeIds, []);
+  await member.request(`/cards/${card.id}/comments`, { method: 'POST', status: 404, body: { body: 'No longer allowed' } });
+  await owner.request(`/labels/${label.id}`, { method: 'DELETE' });
+  assert.deepEqual((await owner.request(`/cards/${card.id}`)).labelIds, []);
+});
+
+test('copies are independent, cross-board moves authorize destination, and deletion requires archive confirmation', async () => {
+  const owner = await account('copy-owner'), outsider = await account('copy-outsider');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Copies' } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Source' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Todo' } });
+  await owner.request(`/lists/${list.id}`, { method: 'PATCH', body: { wipLimit: 1 } });
+  await owner.request(`/lists/${list.id}`, { method: 'PATCH', status: 400, body: { wipLimit: 0 } });
+  const card = await owner.request(`/lists/${list.id}/cards`, { method: 'POST', status: 201, body: { title: 'Original' } });
+  const checklist = await owner.request(`/cards/${card.id}/checklists`, { method: 'POST', status: 201, body: { title: 'Checklist' } });
+  const item = await owner.request(`/checklists/${checklist.id}/items`, { method: 'POST', status: 201, body: { title: 'Task' } });
+  await owner.request(`/checklist-items/${item.id}`, { method: 'PATCH', body: { completed: true } });
+  const label = await owner.request(`/boards/${board.id}/labels`, { method: 'POST', status: 201, body: { name: 'Label', color: '#123456' } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { labelIds: [label.id] } });
+  const copy = await owner.request(`/cards/${card.id}/copy`, { method: 'POST', status: 201, body: { listId: list.id, title: 'Copy' } });
+  assert.notEqual(copy.id, card.id);
+  let detail = await owner.request(`/cards/${copy.id}`);
+  assert.notEqual(detail.checklists[0].id, checklist.id);
+  assert.equal(detail.checklists[0].items[0].completed, false);
+  await owner.request(`/cards/${copy.id}`, { method: 'PATCH', body: { title: 'Independent' } });
+  assert.equal((await owner.request(`/cards/${card.id}`)).title, 'Original');
+  const boardCopy = await owner.request(`/boards/${board.id}/copy`, { method: 'POST', status: 201, body: { title: 'Board copy' } });
+  let copied = await owner.request(`/boards/${boardCopy.id}`);
+  assert.equal(copied.lists[0].wipLimit, 1);
+  assert.equal(copied.lists[0].cards.length, 2);
+  assert.notEqual(copied.labels[0].id, label.id);
+  assert.deepEqual(copied.lists[0].cards[0].labelIds, [copied.labels[0].id]);
+  const foreign = await outsider.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Hidden' } });
+  const foreignBoard = await outsider.request(`/workspaces/${foreign.id}/boards`, { method: 'POST', status: 201, body: { title: 'Hidden' } });
+  const foreignList = await outsider.request(`/boards/${foreignBoard.id}/lists`, { method: 'POST', status: 201, body: { title: 'Hidden' } });
+  await owner.request(`/cards/${card.id}/move`, { method: 'POST', status: 404, body: { listId: foreignList.id, position: 0 } });
+  await owner.request(`/cards/${card.id}/move`, { method: 'POST', body: { listId: copied.lists[0].id, position: 0 } });
+  detail = await owner.request(`/cards/${card.id}`);
+  assert.equal(detail.boardId, boardCopy.id);
+  assert.deepEqual(detail.labelIds, []);
+  await owner.request(`/cards/${copy.id}`, { method: 'DELETE', status: 409, body: { confirm: true } });
+  await owner.request(`/cards/${copy.id}`, { method: 'PATCH', body: { archived: true } });
+  await owner.request(`/cards/${copy.id}`, { method: 'DELETE', status: 409 });
+  await owner.request(`/cards/${copy.id}`, { method: 'DELETE', body: { confirm: true } });
+  await owner.request(`/cards/${copy.id}`, { status: 404 });
+  await owner.request(`/lists/${list.id}`, { method: 'PATCH', body: { archived: true } });
+  await owner.request(`/lists/${list.id}`, { method: 'DELETE', body: { confirm: true } });
+});
+
+test('ownership transfer is atomic, owner-only, and leaves a new owner', async () => {
+  const owner = await account('transfer-owner'), member = await account('transfer-member'), outsider = await account('transfer-outsider');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Transfer' } });
+  const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+  await member.request(`/workspaces/${workspace.id}/transfer`, { method: 'POST', status: 403, body: { userId: owner.user.id } });
+  await owner.request(`/workspaces/${workspace.id}/transfer`, { method: 'POST', status: 400, body: { userId: outsider.user.id } });
+  const transferred = await owner.request(`/workspaces/${workspace.id}/transfer`, { method: 'POST', body: { userId: member.user.id } });
+  assert.equal(transferred.role, 'member');
+  assert.equal((await member.request(`/workspaces/${workspace.id}`)).role, 'owner');
+  await owner.request(`/workspaces/${workspace.id}`, { method: 'PATCH', status: 403, body: { name: 'Forbidden' } });
+  await member.request(`/workspaces/${workspace.id}/members/${member.user.id}`, { method: 'DELETE', status: 409 });
+  const recorded = await pool.query('SELECT action,target_id FROM workspace_activity WHERE workspace_id=$1', [workspace.id]);
+  assert.equal(recorded.rows[0].action, 'ownership.transferred');
+  assert.equal(recorded.rows[0].target_id, member.user.id);
+});
+
+
+test('upgrade from core schema preserves existing card data and migration is repeatable', async () => {
+  const client = await pool.connect();
+  const schema = `upgrade_${randomUUID().replaceAll('-', '')}`;
+  try {
+    await client.query(`CREATE SCHEMA ${schema}`);
+    await client.query(`SET search_path TO ${schema}`);
+    await client.query(await readFile(new URL('../migrations/001_init.sql', import.meta.url), 'utf8'));
+    await client.query('CREATE TABLE schema_migrations(name text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now())');
+    await client.query("INSERT INTO schema_migrations(name) VALUES('001_init.sql')");
+    const workspaceId = randomUUID(), boardId = randomUUID(), listId = randomUUID(), cardId = randomUUID();
+    await client.query('INSERT INTO workspaces(id,name) VALUES($1,$2)', [workspaceId, 'Existing workspace']);
+    await client.query('INSERT INTO boards(id,workspace_id,title) VALUES($1,$2,$3)', [boardId, workspaceId, 'Existing board']);
+    await client.query('INSERT INTO lists(id,board_id,title,position) VALUES($1,$2,$3,0)', [listId, boardId, 'Existing list']);
+    await client.query('INSERT INTO cards(id,list_id,title,description,position,archived) VALUES($1,$2,$3,$4,2,true)', [cardId, listId, 'Existing card', 'Preserve me']);
+    const scopedPool = { connect: async () => ({ query: client.query.bind(client), release() {} }) };
+    await migrate(scopedPool);
+    await migrate(scopedPool);
+    const row = (await client.query('SELECT * FROM cards WHERE id=$1', [cardId])).rows[0];
+    assert.equal(row.description, 'Preserve me');
+    assert.equal(row.position, 2);
+    assert.equal(row.archived, true);
+    assert.deepEqual(row.label_ids, []);
+    assert.deepEqual(row.assignee_ids, []);
+    assert.equal(row.completed, false);
+    assert.equal(row.due_date, null);
+    assert.equal((await client.query('SELECT wip_limit FROM lists WHERE id=$1', [listId])).rows[0].wip_limit, null);
+    assert.equal((await client.query('SELECT count(*)::int AS count FROM schema_migrations')).rows[0].count, 2);
+  } finally {
+    await client.query('RESET search_path');
+    await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    client.release();
+  }
 });

@@ -4,6 +4,7 @@ import cookieParser from 'cookie-parser';
 import { randomUUID } from 'node:crypto';
 import { installAuth, fail, text, email, hash, secretToken } from './auth.js';
 import { transaction } from './db.js';
+import { installTaskManagement, cardExtras, cardDetails, editCardExtras, logActivity } from './tasks.js';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function id(value) {
@@ -22,8 +23,8 @@ function color(value) {
   if (typeof value !== 'string' || !/^#[0-9a-f]{6}$/i.test(value)) fail(400, 'VALIDATION_ERROR', 'Use a six-digit hex color.');
   return value;
 }
-const listData = row => ({ id: row.id, boardId: row.board_id, title: row.title, position: row.position, archived: row.archived });
-const cardData = row => ({ id: row.id, listId: row.list_id, title: row.title, description: row.description, position: row.position, archived: row.archived });
+const listData = row => ({ id: row.id, boardId: row.board_id, title: row.title, position: row.position, archived: row.archived, wipLimit: row.wip_limit ?? null });
+const cardData = row => ({ id: row.id, listId: row.list_id, title: row.title, description: row.description, position: row.position, archived: row.archived, ...cardExtras(row) });
 const boardData = row => ({ id: row.id, workspaceId: row.workspace_id, title: row.title, color: row.color, closed: row.closed, favorite: row.favorite || false, lastOpenedAt: row.last_opened_at || null });
 
 export function createApp({ pool, redis, config }) {
@@ -103,6 +104,7 @@ export function createApp({ pool, redis, config }) {
         if (count.count <= 1) fail(409, 'LAST_OWNER', 'The last workspace owner cannot be removed.');
       }
       await client.query('DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
+      await client.query('UPDATE cards SET assignee_ids=array_remove(assignee_ids,$1) WHERE list_id IN(SELECT l.id FROM lists l JOIN boards b ON b.id=l.board_id WHERE b.workspace_id=$2)', [req.params.userId, req.params.id]);
     });
     res.json({ message: 'Member removed.' });
   });
@@ -148,8 +150,26 @@ export function createApp({ pool, redis, config }) {
       await boardAccess(client, req.params.id, req.user.id, { lock: true });
       const { rows: [row] } = await client.query(`${boardsQuery} WHERE b.id=$2`, [req.user.id, req.params.id]);
       const { rows: lists } = await client.query('SELECT * FROM lists WHERE board_id=$1 ORDER BY position,id', [row.id]);
-      const { rows: cards } = await client.query('SELECT c.* FROM cards c JOIN lists l ON l.id=c.list_id WHERE l.board_id=$1 ORDER BY c.position,c.id', [row.id]);
-      return { ...boardData(row), lists: lists.map(list => ({ ...listData(list), cards: cards.filter(card => card.list_id === list.id).map(cardData) })) };
+      const { rows: allCards } = await client.query('SELECT c.* FROM cards c JOIN lists l ON l.id=c.list_id WHERE l.board_id=$1 ORDER BY c.position,c.id', [row.id]);
+      const query = req.query.query;
+      if (query !== undefined && (typeof query !== 'string' || query.length > 200)) fail(400, 'VALIDATION_ERROR', 'Search must be at most 200 characters.');
+      for (const key of ['labelId', 'assigneeId']) if (req.query[key] !== undefined) id(req.query[key]);
+      const due = req.query.due;
+      if (due !== undefined && !['', 'overdue', 'upcoming', 'completed', 'none'].includes(due)) fail(400, 'VALIDATION_ERROR', 'Invalid due filter.');
+      const now = Date.now();
+      const cards = allCards.filter(card => {
+        if (query && !`${card.title} ${card.description}`.toLowerCase().includes(query.toLowerCase())) return false;
+        if (req.query.labelId && !card.label_ids.includes(req.query.labelId)) return false;
+        if (req.query.assigneeId && !card.assignee_ids.includes(req.query.assigneeId)) return false;
+        if (!due) return true;
+        if (due === 'completed') return card.completed;
+        if (due === 'none') return !card.due_date;
+        if (card.completed || !card.due_date) return false;
+        const timestamp = new Date(card.due_date).getTime();
+        return due === 'overdue' ? timestamp < now : timestamp >= now && timestamp <= now + 7 * 86400000;
+      });
+      const labels = (await client.query('SELECT id,name,color FROM labels WHERE board_id=$1 ORDER BY name,id', [row.id])).rows;
+      return { ...boardData(row), labels, lists: lists.map(list => ({ ...listData(list), cards: cards.filter(card => card.list_id === list.id).map(cardData) })) };
     });
     res.json(board);
   });
@@ -188,7 +208,9 @@ export function createApp({ pool, redis, config }) {
   app.patch('/api/lists/:id', async (req, res) => {
     const list = await transaction(pool, async client => {
       const row = await listAccess(client, req.params.id, req.user.id, { lock: true, write: true });
-      return (await client.query('UPDATE lists SET title=$1,archived=$2 WHERE id=$3 RETURNING *', [req.body.title === undefined ? row.title : text(req.body.title, 'List title', 100), req.body.archived === undefined ? row.archived : bool(req.body.archived, 'Archived'), row.id])).rows[0];
+      const limit = req.body.wipLimit === undefined ? row.wip_limit : req.body.wipLimit;
+      if (limit !== null && (!Number.isInteger(limit) || limit < 1 || limit > 10000)) fail(400, 'VALIDATION_ERROR', 'WIP limit must be 1 to 10000 or null.');
+      return (await client.query('UPDATE lists SET title=$1,archived=$2,wip_limit=$4 WHERE id=$3 RETURNING *', [req.body.title === undefined ? row.title : text(req.body.title, 'List title', 100), req.body.archived === undefined ? row.archived : bool(req.body.archived, 'Archived'), row.id, limit])).rows[0];
     });
     res.json(listData(list));
   });
@@ -225,7 +247,7 @@ export function createApp({ pool, redis, config }) {
   });
   app.get('/api/cards/:id', async (req, res) => {
     const card = await cardAccess(pool, req.params.id, req.user.id);
-    res.json({ ...cardData(card), boardId: card.board_id, workspaceId: card.workspace_id });
+    res.json({ ...cardData(card), boardId: card.board_id, workspaceId: card.workspace_id, ...await cardDetails(pool, card.id) });
   });
   app.patch('/api/cards/:id', async (req, res) => {
     const card = await transaction(pool, async client => {
@@ -233,6 +255,8 @@ export function createApp({ pool, redis, config }) {
       const list = (await client.query('SELECT archived FROM lists WHERE id=$1', [row.list_id])).rows[0];
       if (list.archived) fail(409, 'LIST_ARCHIVED', 'Restore the parent list before editing its cards.');
       if (req.body.description !== undefined && (typeof req.body.description !== 'string' || req.body.description.length > 20000)) fail(400, 'VALIDATION_ERROR', 'Description must be text up to 20000 characters.');
+      await editCardExtras(client, row, req.body, { id, color, bool });
+      await logActivity(client, row, req.user.id, 'card.updated');
       return (await client.query('UPDATE cards SET title=$1,description=$2,archived=$3 WHERE id=$4 RETURNING *', [req.body.title === undefined ? row.title : text(req.body.title, 'Card title', 200), req.body.description ?? row.description, req.body.archived === undefined ? row.archived : bool(req.body.archived, 'Archived'), row.id])).rows[0];
     });
     res.json(cardData(card));
@@ -240,8 +264,13 @@ export function createApp({ pool, redis, config }) {
   app.post('/api/cards/:id/move', async (req, res) => {
     const card = await transaction(pool, async client => {
       const row = await cardAccess(client, req.params.id, req.user.id, { lock: true, write: true });
-      const destination = await listAccess(client, req.body.listId, req.user.id);
-      if (destination.board_id !== row.board_id) fail(400, 'CROSS_BOARD_MOVE', 'Cards can only move within their board.');
+      const destination = await listAccess(client, req.body.listId, req.user.id, { lock: true, write: true });
+      if (destination.board_id !== row.board_id) {
+        const destBoard = await boardAccess(client, destination.board_id, req.user.id, { write: true });
+        if (destBoard.workspace_id !== row.workspace_id) fail(400, 'CROSS_WORKSPACE_MOVE', 'Move cards only between boards in the same workspace.');
+        await client.query('UPDATE cards SET label_ids=ARRAY[]::uuid[],assignee_ids=ARRAY(SELECT user_id FROM memberships WHERE workspace_id=$1 AND user_id=ANY($2::uuid[])) WHERE id=$3', [destBoard.workspace_id, row.assignee_ids, row.id]);
+        await client.query('UPDATE activity SET board_id=$1 WHERE card_id=$2', [destination.board_id, row.id]);
+      }
       const source = (await client.query('SELECT archived FROM lists WHERE id=$1', [row.list_id])).rows[0];
       if (row.archived || source.archived || destination.archived) fail(409, 'ARCHIVED_RESOURCE', 'Restore the card and lists before moving.');
       const target = position(req.body.position);
@@ -251,10 +280,12 @@ export function createApp({ pool, redis, config }) {
         for (const [index, sibling] of siblings.entries()) await client.query('UPDATE cards SET position=$1 WHERE id=$2', [index, sibling.id]);
       }
       await reorder(client, 'cards', 'list_id', destination.id, row.id, target);
+      await logActivity(client, { ...row, board_id: destination.board_id }, req.user.id, 'card.moved');
       return (await client.query('SELECT * FROM cards WHERE id=$1', [row.id])).rows[0];
     });
     res.json(cardData(card));
   });
+  installTaskManagement(app, { pool, membership, boardAccess, listAccess, cardAccess, id, color, bool, position, cardData, listData, boardData });
   app.use((req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }));
   app.use((error, req, res, next) => {
     if (res.headersSent) return next(error);
