@@ -8,6 +8,7 @@ import { createClient } from 'redis';
 import { database } from '../src/db.js';
 import { migrate } from '../src/migrate.js';
 import { createApp } from '../src/app.js';
+import { grantAdministrator } from '../src/bootstrap-admin.js';
 
 if (!process.env.TEST_DATABASE_URL) throw new Error('TEST_DATABASE_URL is required; use a disposable test database.');
 const pool = database(process.env.TEST_DATABASE_URL);
@@ -319,10 +320,151 @@ test('upgrade from core schema preserves existing card data and migration is rep
     assert.equal(row.completed, false);
     assert.equal(row.due_date, null);
     assert.equal((await client.query('SELECT wip_limit FROM lists WHERE id=$1', [listId])).rows[0].wip_limit, null);
-    assert.equal((await client.query('SELECT count(*)::int AS count FROM schema_migrations')).rows[0].count, 2);
+    assert.equal((await client.query('SELECT count(*)::int AS count FROM schema_migrations')).rows[0].count, 3);
+    assert.equal((await client.query('SELECT archived FROM workspaces WHERE id=$1', [workspaceId])).rows[0].archived, false);
   } finally {
     await client.query('RESET search_path');
     await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     client.release();
   }
+});
+
+
+test('application administration is separate, audited, confirmed and protects the last active admin', async () => {
+  const admin = await account('app-admin'), other = await account('app-admin-other'), user = await account('app-user');
+  assert.equal(admin.user.isAdmin, false);
+  for (const path of ['/admin/overview', '/admin/users', '/admin/workspaces', '/admin/boards', '/admin/audit']) await user.request(path, { status: 403 });
+  await user.request(`/admin/users/${user.user.id}`, { method: 'PATCH', status: 403, body: { isAdmin: true, confirm: true } });
+  await assert.rejects(grantAdministrator(pool, `missing-${suffix}@example.com`), error => error.code === 'NOT_FOUND');
+  await grantAdministrator(pool, admin.user.email);
+  await grantAdministrator(pool, admin.user.email);
+  const bootstrap = await pool.query("SELECT * FROM admin_audit WHERE target_id=$1 AND action='user.admin_bootstrapped'", [admin.user.id]);
+  assert.equal(bootstrap.rowCount, 1);
+  assert.equal(bootstrap.rows[0].actor_id, null);
+  assert.equal((await admin.request('/auth/me')).isAdmin, true);
+  await admin.request(`/admin/users/${admin.user.id}`, { method: 'PATCH', status: 409, body: { isAdmin: false, confirm: true } });
+  await admin.request(`/admin/users/${admin.user.id}`, { method: 'PATCH', status: 409, body: { suspended: true, confirm: true } });
+  await admin.request(`/admin/users/${other.user.id}`, { method: 'PATCH', status: 400, body: { isAdmin: true } });
+  await admin.request(`/admin/users/${other.user.id}`, { method: 'PATCH', body: { isAdmin: true, confirm: true } });
+  assert.equal((await other.request('/auth/me')).isAdmin, true);
+  const users = await admin.request(`/admin/users?q=${encodeURIComponent(user.user.email)}&page=1&pageSize=1`);
+  assert.equal(users.total, 1);
+  assert.equal(users.items[0].id, user.user.id);
+  assert.equal('password_hash' in users.items[0], false);
+  await admin.request('/admin/users?page=0', { status: 400 });
+  const overview = await admin.request('/admin/overview');
+  assert.ok(overview.users >= 3);
+  assert.equal(overview.admins, 2);
+  await other.request(`/admin/users/${admin.user.id}`, { method: 'PATCH', body: { isAdmin: false, confirm: true } });
+  await admin.request('/auth/me', { status: 401 });
+  await admin.request('/auth/login', { method: 'POST', body: { email: admin.user.email, password: 'learning-password-123' } });
+  await admin.request('/admin/overview', { status: 403 });
+  await other.request(`/admin/users/${other.user.id}`, { method: 'PATCH', status: 409, body: { suspended: true, confirm: true } });
+  const audit = await other.request(`/admin/audit?actorId=${other.user.id}&action=user.updated`);
+  assert.ok(audit.items.some(item => item.targetId === admin.user.id && item.details.after.isAdmin === false));
+  assert.ok(audit.items.every(item => item.actorId === other.user.id && item.details.outcome === 'success'));
+});
+
+test('suspension immediately invalidates access and renewal; restoration requires a fresh login', async () => {
+  const admin = await account('suspend-admin'), user = await account('suspend-user');
+  await grantAdministrator(pool, admin.user.email);
+  const second = browser();
+  await second.request('/auth/login', { method: 'POST', body: { email: user.user.email, password: 'learning-password-123' } });
+  const { csrfToken } = await user.request('/auth/csrf');
+  const oldToken = user.token;
+  await admin.request(`/admin/users/${user.user.id}`, { method: 'PATCH', body: { suspended: true, confirm: true } });
+  await user.request('/auth/me', { status: 401 });
+  await second.request('/auth/me', { status: 401 });
+  await user.request('/auth/renew', { method: 'POST', status: 401, csrf: csrfToken });
+  await user.request('/auth/login', { method: 'POST', status: 403, body: { email: user.user.email, password: 'learning-password-123' } });
+  await user.request('/auth/forgot-password', { method: 'POST', body: { email: user.user.email } });
+  const preview = JSON.parse(await readFile(join(mailDir, `${user.user.id}.json`), 'utf8'));
+  await user.request('/auth/reset-password', { method: 'POST', body: { token: new URL(preview.resetUrl).searchParams.get('token'), newPassword: 'new-suspended-password-123' } });
+  await user.request('/auth/login', { method: 'POST', status: 403, body: { email: user.user.email, password: 'new-suspended-password-123' } });
+  await admin.request(`/admin/users/${user.user.id}`, { method: 'PATCH', body: { suspended: false, confirm: true } });
+  user.token = oldToken;
+  await user.request('/auth/me', { status: 401 });
+  await user.request('/auth/login', { method: 'POST', body: { email: user.user.email, password: 'new-suspended-password-123' } });
+  assert.equal((await user.request('/auth/me')).id, user.user.id);
+});
+
+test('admin metadata access does not expose private boards and archived workspaces reject every scoped write', async () => {
+  const admin = await account('metadata-admin'), owner = await account('metadata-owner'), guest = await account('metadata-guest');
+  await grantAdministrator(pool, admin.user.email);
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Private metadata scope' } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Secret board' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Secret list' } });
+  const card = await owner.request(`/lists/${list.id}/cards`, { method: 'POST', status: 201, body: { title: 'Private content' } });
+  const checklist = await owner.request(`/cards/${card.id}/checklists`, { method: 'POST', status: 201, body: { title: 'Private tasks' } });
+  const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: guest.user.email } });
+  await admin.request(`/boards/${board.id}`, { status: 404 });
+  await admin.request(`/cards/${card.id}`, { status: 404 });
+  const rows = await admin.request('/admin/boards?q=Secret%20board');
+  assert.equal(rows.items[0].id, board.id);
+  assert.equal('lists' in rows.items[0], false);
+  assert.equal('cards' in rows.items[0], false);
+  const members = await admin.request(`/admin/workspaces/${workspace.id}/members`);
+  assert.equal(members[0].id, owner.user.id);
+  await admin.request(`/admin/boards/${board.id}`, { method: 'PATCH', body: { closed: true, confirm: true } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', status: 409, body: { title: 'Blocked by close' } });
+  await admin.request(`/admin/boards/${board.id}`, { method: 'PATCH', body: { closed: false, confirm: true } });
+  await admin.request(`/admin/workspaces/${workspace.id}`, { method: 'PATCH', status: 400, body: { archived: true } });
+  await admin.request(`/admin/workspaces/${workspace.id}`, { method: 'PATCH', body: { archived: true, confirm: true } });
+  await owner.request(`/workspaces/${workspace.id}`, { status: 409 });
+  await owner.request(`/boards/${board.id}`, { status: 409 });
+  await owner.request(`/cards/${card.id}`, { status: 409 });
+  assert.equal((await owner.request('/workspaces')).some(row => row.id === workspace.id), false);
+  for (const [path, method, body] of [
+    [`/workspaces/${workspace.id}`, 'PATCH', { name: 'Blocked' }],
+    [`/workspaces/${workspace.id}/boards`, 'POST', { title: 'Blocked' }],
+    [`/workspaces/${workspace.id}/invitations`, 'POST', { email: guest.user.email }],
+    [`/workspaces/${workspace.id}/invitations/${invitation.id}`, 'DELETE', {}],
+    [`/workspaces/${workspace.id}/members/${owner.user.id}`, 'DELETE', {}],
+    [`/workspaces/${workspace.id}/transfer`, 'POST', { userId: guest.user.id }],
+    [`/boards/${board.id}`, 'PATCH', { title: 'Blocked' }],
+    [`/boards/${board.id}/preferences`, 'PATCH', { favorite: true }],
+    [`/boards/${board.id}/copy`, 'POST', {}],
+    [`/boards/${board.id}/labels`, 'POST', { name: 'Blocked', color: '#123456' }],
+    [`/lists/${list.id}`, 'PATCH', { title: 'Blocked' }],
+    [`/lists/${list.id}/cards`, 'POST', { title: 'Blocked' }],
+    [`/cards/${card.id}`, 'PATCH', { title: 'Blocked' }],
+    [`/cards/${card.id}/comments`, 'POST', { body: 'Blocked' }],
+    [`/checklists/${checklist.id}/items`, 'POST', { title: 'Blocked' }],
+  ]) {
+    const failure = await owner.request(path, { method, body, status: 409 });
+    assert.equal(failure.error.code, 'WORKSPACE_ARCHIVED');
+  }
+  await guest.request('/invitations/accept', { method: 'POST', status: 409, body: { token: invitation.token } });
+  await admin.request(`/cards/${card.id}`, { method: 'PATCH', status: 404, body: { title: 'No override' } });
+  await admin.request(`/admin/workspaces/${workspace.id}`, { method: 'PATCH', body: { archived: false, confirm: true } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { title: 'Restored' } });
+  await guest.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+});
+
+test('session inventory and revocation never expose credentials or another user session', async () => {
+  const user = await account('sessions-user'), stranger = await account('sessions-stranger');
+  const second = browser(), third = browser();
+  for (const client of [second, third]) await client.request('/auth/login', { method: 'POST', body: { email: user.user.email, password: 'learning-password-123' } });
+  let sessions = await user.request('/auth/sessions');
+  assert.equal(sessions.length, 3);
+  assert.equal(sessions.filter(row => row.current).length, 1);
+  assert.ok(sessions.every(row => row.userAgent && row.createdAt && row.lastUsedAt && row.expiresAt));
+  assert.ok(sessions.every(row => !('token_hash' in row) && !('accessToken' in row)));
+  const currentId = sessions.find(row => row.current).id;
+  const secondId = (await second.request('/auth/sessions')).find(row => row.current).id;
+  await stranger.request(`/auth/sessions/${secondId}`, { method: 'DELETE', status: 404 });
+  const { csrfToken } = await second.request('/auth/csrf');
+  await second.request('/auth/renew', { method: 'POST', csrf: csrfToken });
+  assert.equal((await second.request('/auth/sessions')).find(row => row.current).id, secondId);
+  await user.request(`/auth/sessions/${secondId}`, { method: 'DELETE' });
+  await second.request('/auth/me', { status: 401 });
+  await second.request('/auth/renew', { method: 'POST', csrf: csrfToken, status: 401 });
+  await user.request('/auth/sessions/revoke-others', { method: 'POST', status: 400 });
+  await user.request('/auth/sessions/revoke-others', { method: 'POST', body: { confirm: true } });
+  await third.request('/auth/me', { status: 401 });
+  sessions = await user.request('/auth/sessions');
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].id, currentId);
+  await user.request(`/auth/sessions/${currentId}`, { method: 'DELETE' });
+  await user.request('/auth/me', { status: 401 });
 });

@@ -4,6 +4,7 @@ import cookieParser from 'cookie-parser';
 import { randomUUID } from 'node:crypto';
 import { installAuth, fail, text, email, hash, secretToken } from './auth.js';
 import { transaction } from './db.js';
+import { installAdmin, installArchiveGuard, workspaceActive } from './admin.js';
 import { installTaskManagement, cardExtras, cardDetails, editCardExtras, logActivity } from './tasks.js';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -25,7 +26,7 @@ function color(value) {
 }
 const listData = row => ({ id: row.id, boardId: row.board_id, title: row.title, position: row.position, archived: row.archived, wipLimit: row.wip_limit ?? null });
 const cardData = row => ({ id: row.id, listId: row.list_id, title: row.title, description: row.description, position: row.position, archived: row.archived, ...cardExtras(row) });
-const boardData = row => ({ id: row.id, workspaceId: row.workspace_id, title: row.title, color: row.color, closed: row.closed, favorite: row.favorite || false, lastOpenedAt: row.last_opened_at || null });
+const boardData = row => ({ id: row.id, workspaceId: row.workspace_id, title: row.title, color: row.color, closed: row.closed, favorite: row.favorite || false, lastOpenedAt: row.last_opened_at || null, workspaceArchived: row.workspace_archived || false });
 
 export function createApp({ pool, redis, config }) {
   const app = express();
@@ -45,15 +46,18 @@ export function createApp({ pool, redis, config }) {
     }
     next();
   });
+  installArchiveGuard(app, { pool });
   async function membership(client, workspaceId, userId, owner = false) {
     const { rows: [row] } = await client.query('SELECT w.*,m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE w.id=$1 AND m.user_id=$2', [workspaceId, userId]);
     if (!row) fail(404, 'NOT_FOUND', 'Workspace not found.');
+    if (row.archived) fail(409, 'WORKSPACE_ARCHIVED', 'This workspace is archived. Ask an application administrator to restore it.');
     if (owner && row.role !== 'owner') fail(403, 'FORBIDDEN', 'Workspace owner access required.');
     return row;
   }
   async function boardAccess(client, boardId, userId, { lock = false, write = false } = {}) {
-    const { rows: [board] } = await client.query(`SELECT b.* FROM boards b JOIN memberships m ON m.workspace_id=b.workspace_id WHERE b.id=$1 AND m.user_id=$2${lock ? ' FOR UPDATE OF b' : ''}`, [boardId, userId]);
+    const { rows: [board] } = await client.query(`SELECT b.*,w.archived AS workspace_archived FROM boards b JOIN workspaces w ON w.id=b.workspace_id JOIN memberships m ON m.workspace_id=b.workspace_id WHERE b.id=$1 AND m.user_id=$2${lock ? ' FOR UPDATE OF b' : ''}`, [boardId, userId]);
     if (!board) fail(404, 'NOT_FOUND', 'Board not found.');
+    if (board.workspace_archived) fail(409, 'WORKSPACE_ARCHIVED', 'Restore the workspace before editing.');
     if (write && board.closed) fail(409, 'BOARD_CLOSED', 'Reopen the board before editing.');
     return board;
   }
@@ -69,9 +73,9 @@ export function createApp({ pool, redis, config }) {
     await boardAccess(client, row.board_id, userId, options);
     return (await client.query('SELECT c.*,l.board_id,b.workspace_id FROM cards c JOIN lists l ON l.id=c.list_id JOIN boards b ON b.id=l.board_id WHERE c.id=$1', [cardId])).rows[0];
   }
-  const workspaceData = row => ({ id: row.id, name: row.name, role: row.role });
+  const workspaceData = row => ({ id: row.id, name: row.name, role: row.role, archived: row.archived || false });
   app.get('/api/workspaces', async (req, res) => {
-    const { rows } = await pool.query('SELECT w.*,m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=$1 ORDER BY w.created_at,w.id', [req.user.id]);
+    const { rows } = await pool.query('SELECT w.*,m.role FROM workspaces w JOIN memberships m ON m.workspace_id=w.id WHERE m.user_id=$1 AND NOT w.archived ORDER BY w.created_at,w.id', [req.user.id]);
     res.json(rows.map(workspaceData));
   });
   app.post('/api/workspaces', async (req, res) => {
@@ -129,13 +133,14 @@ export function createApp({ pool, redis, config }) {
     const workspace = await transaction(pool, async client => {
       const { rows: [invitation] } = await client.query('SELECT * FROM invitations WHERE token_hash=$1 AND accepted_at IS NULL AND NOT revoked AND expires_at>now() FOR UPDATE', [hash(text(req.body.token, 'Token'))]);
       if (!invitation || invitation.email !== req.user.email) fail(400, 'INVALID_INVITATION', 'Invitation is invalid, expired, or belongs to another account.');
+      await workspaceActive(client, invitation.workspace_id);
       await client.query('INSERT INTO memberships(workspace_id,user_id,role) VALUES($1,$2,\'member\') ON CONFLICT DO NOTHING', [invitation.workspace_id, req.user.id]);
       await client.query('UPDATE invitations SET accepted_at=now() WHERE id=$1', [invitation.id]);
       return membership(client, invitation.workspace_id, req.user.id);
     });
     res.json(workspaceData(workspace));
   });
-  const boardsQuery = 'SELECT b.*,p.favorite,p.last_opened_at FROM boards b LEFT JOIN board_preferences p ON p.board_id=b.id AND p.user_id=$1';
+  const boardsQuery = 'SELECT b.*,w.archived AS workspace_archived,p.favorite,p.last_opened_at FROM boards b JOIN workspaces w ON w.id=b.workspace_id LEFT JOIN board_preferences p ON p.board_id=b.id AND p.user_id=$1';
   app.get('/api/workspaces/:id/boards', async (req, res) => {
     await membership(pool, req.params.id, req.user.id);
     res.json((await pool.query(`${boardsQuery} WHERE b.workspace_id=$2 ORDER BY b.created_at,b.id`, [req.user.id, req.params.id])).rows.map(boardData));
@@ -285,6 +290,7 @@ export function createApp({ pool, redis, config }) {
     });
     res.json(cardData(card));
   });
+  installAdmin(app, { pool, id, bool });
   installTaskManagement(app, { pool, membership, boardAccess, listAccess, cardAccess, id, color, bool, position, cardData, listData, boardData });
   app.use((req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }));
   app.use((error, req, res, next) => {

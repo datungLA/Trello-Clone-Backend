@@ -6,7 +6,7 @@ import { transaction } from './db.js';
 
 export const hash = value => createHash('sha256').update(value).digest('hex');
 export const secretToken = () => randomBytes(32).toString('base64url');
-export const publicUser = row => ({ id: row.id, email: row.email, displayName: row.display_name });
+export const publicUser = row => ({ id: row.id, email: row.email, displayName: row.display_name, isAdmin: row.is_admin === true });
 export function fail(status, code, message) { throw Object.assign(new Error(message), { status, code }); }
 export function text(value, name, max = 200) {
   if (typeof value !== 'string' || !value.trim() || value.trim().length > max) fail(400, 'VALIDATION_ERROR', `${name} is required (maximum ${max} characters).`);
@@ -30,9 +30,9 @@ export function installAuth(app, { pool, redis, config }) {
     algorithm: 'HS256', issuer: 'trello-api', audience: 'trello-web', subject: user.id,
     jwtid: randomUUID(), expiresIn: '15m', notBefore: 0,
   });
-  const issue = async (client, user, res, family = randomUUID()) => {
+  const issue = async (client, user, res, family = randomUUID(), userAgent = 'Unknown device') => {
     const raw = secretToken();
-    await client.query('INSERT INTO refresh_tokens(token_hash,user_id,family_id,expires_at) VALUES($1,$2,$3,now()+interval \'7 days\')', [hash(raw), user.id, family]);
+    await client.query('INSERT INTO refresh_tokens(token_hash,user_id,family_id,expires_at,user_agent) VALUES($1,$2,$3,now()+interval \'7 days\',$4)', [hash(raw), user.id, family, userAgent.slice(0,300)]);
     res.cookie(cookieName, raw, cookieOptions);
     return { user: publicUser(user), accessToken: sign(user, family) };
   };
@@ -73,7 +73,7 @@ export function installAuth(app, { pool, redis, config }) {
     const name = text(req.body.displayName || normalized.split('@')[0], 'Display name', 80);
     const result = await transaction(pool, async client => {
       const { rows } = await client.query('INSERT INTO users(id,email,display_name,password_hash) VALUES($1,$2,$3,$4) RETURNING *', [randomUUID(), normalized, name, passwordHash]);
-      return issue(client, rows[0], res);
+      return issue(client, rows[0], res, undefined, req.get('User-Agent') || 'Unknown device');
     });
     res.status(201).json(result);
   });
@@ -82,7 +82,13 @@ export function installAuth(app, { pool, redis, config }) {
     const { rows: [user] } = await pool.query('SELECT * FROM users WHERE email=$1', [normalized]);
     const valid = await bcrypt.compare(typeof req.body.password === 'string' && Buffer.byteLength(req.body.password) <= 72 ? req.body.password : '', user?.password_hash || dummyHash);
     if (!valid || !user) fail(401, 'INVALID_CREDENTIALS', 'Email or password is incorrect.');
-    res.json(await issue(pool, user, res));
+    if (user.suspended_at) fail(403, 'ACCOUNT_SUSPENDED', 'This account is suspended.');
+    res.json(await transaction(pool, async client => {
+      const current = (await client.query('SELECT * FROM users WHERE id=$1 FOR SHARE', [user.id])).rows[0];
+      if (current.suspended_at) fail(403, 'ACCOUNT_SUSPENDED', 'This account is suspended.');
+      if (current.password_hash !== user.password_hash) fail(401, 'INVALID_CREDENTIALS', 'Credentials changed. Sign in again.');
+      return issue(client, current, res, undefined, req.get('User-Agent') || 'Unknown device');
+    }));
   });
   app.post('/api/auth/renew', csrf, async (req, res) => {
     const raw = req.cookies[cookieName];
@@ -90,6 +96,7 @@ export function installAuth(app, { pool, redis, config }) {
     const result = await transaction(pool, async client => {
       const { rows: [token] } = await client.query('SELECT * FROM refresh_tokens WHERE token_hash=$1 FOR UPDATE', [hash(raw)]);
       if (!token || token.revoked || new Date(token.expires_at) <= new Date()) return { invalid: true };
+      if ((await client.query('SELECT 1 FROM refresh_tokens WHERE family_id=$1 AND revoked LIMIT 1', [token.family_id])).rowCount) return { invalid: true };
       if (token.used_at) {
         if (Date.now() - new Date(token.used_at).getTime() < 5000) return { race: true };
         await client.query('UPDATE refresh_tokens SET revoked=true WHERE user_id=$1', [token.user_id]);
@@ -97,8 +104,9 @@ export function installAuth(app, { pool, redis, config }) {
         return { reuse: true };
       }
       await client.query('UPDATE refresh_tokens SET used_at=now() WHERE token_hash=$1 AND used_at IS NULL', [hash(raw)]);
-      const { rows: [user] } = await client.query('SELECT * FROM users WHERE id=$1', [token.user_id]);
-      return issue(client, user, res, token.family_id);
+      const { rows: [user] } = await client.query('SELECT * FROM users WHERE id=$1 FOR SHARE', [token.user_id]);
+      if (!user || user.suspended_at) return { invalid: true };
+      return issue(client, user, res, token.family_id, token.user_agent);
     });
     if (result.race) fail(409, 'RENEW_IN_PROGRESS', 'Another tab renewed this session. Try again.');
     if (result.invalid || result.reuse) { clear(res); fail(401, result.reuse ? 'REUSE_DETECTED' : 'TOKEN_INVALID', 'Sign in to continue.'); }
@@ -112,8 +120,8 @@ export function installAuth(app, { pool, redis, config }) {
       try { payload = jwt.verify(raw, config.jwtSecret, { algorithms: ['HS256'], issuer: 'trello-api', audience: 'trello-web' }); }
       catch (error) { fail(401, error.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'TOKEN_INVALID', 'Sign in to continue.'); }
       if (!Number.isInteger(payload.exp) || !Number.isInteger(payload.nbf) || !Number.isInteger(payload.iat) || !Number.isInteger(payload.tv) || typeof payload.jti !== 'string' || typeof payload.sub !== 'string' || typeof payload.sid !== 'string') fail(401, 'TOKEN_INVALID', 'Sign in to continue.');
-      const { rows: [user] } = await pool.query('SELECT u.* FROM users u WHERE u.id=$1 AND EXISTS(SELECT 1 FROM refresh_tokens r WHERE r.user_id=u.id AND r.family_id=$2 AND NOT r.revoked AND r.expires_at>now())', [payload.sub, payload.sid]);
-      if (!user || user.token_version !== payload.tv || await redis.get(`revoked-jti:${payload.jti}`)) fail(401, 'TOKEN_INVALID', 'Sign in to continue.');
+      const { rows: [user] } = await pool.query('SELECT u.* FROM users u WHERE u.id=$1 AND EXISTS(SELECT 1 FROM refresh_tokens r WHERE r.user_id=u.id AND r.family_id=$2 AND NOT r.revoked AND r.expires_at>now()) AND NOT EXISTS(SELECT 1 FROM refresh_tokens revoked WHERE revoked.family_id=$2 AND revoked.revoked)', [payload.sub, payload.sid]);
+      if (!user || user.suspended_at || user.token_version !== payload.tv || await redis.get(`revoked-jti:${payload.jti}`)) fail(401, 'TOKEN_INVALID', 'Sign in to continue.');
       req.user = user;
       req.auth = payload;
       next();
@@ -121,8 +129,7 @@ export function installAuth(app, { pool, redis, config }) {
   };
   app.get('/api/auth/me', authenticate, (req, res) => res.json(publicUser(req.user)));
   app.post('/api/auth/logout', csrf, authenticate, async (req, res) => {
-    const raw = req.cookies[cookieName];
-    if (raw) await pool.query('UPDATE refresh_tokens SET revoked=true WHERE family_id=(SELECT family_id FROM refresh_tokens WHERE token_hash=$1 AND user_id=$2)', [hash(raw), req.user.id]);
+    await pool.query('UPDATE refresh_tokens SET revoked=true WHERE family_id=$1 AND user_id=$2', [req.auth.sid, req.user.id]);
     await redis.set(`revoked-jti:${req.auth.jti}`, '1', { EX: Math.max(1, req.auth.exp - Math.floor(Date.now() / 1000)) });
     clear(res);
     res.json({ message: 'Signed out.' });
@@ -150,6 +157,23 @@ export function installAuth(app, { pool, redis, config }) {
     });
     clear(res);
     res.json({ message: 'Password updated. Sign in again.' });
+  });
+  app.get('/api/auth/sessions', authenticate, async (req, res) => {
+    const rows = (await pool.query(`SELECT family_id AS id,min(created_at) AS "createdAt",max(created_at) AS "lastUsedAt",max(expires_at) AS "expiresAt",(array_agg(user_agent ORDER BY created_at DESC))[1] AS "userAgent"
+      FROM refresh_tokens WHERE user_id=$1 GROUP BY family_id HAVING bool_or(expires_at>now()) AND bool_and(NOT revoked) ORDER BY max(created_at) DESC,family_id`, [req.user.id])).rows;
+    res.json(rows.map(row => ({ ...row, current: row.id === req.auth.sid })));
+  });
+  app.post('/api/auth/sessions/revoke-others', authenticate, async (req, res) => {
+    if (req.body.confirm !== true) fail(400, 'CONFIRM_REQUIRED', 'Confirm signing out other sessions.');
+    await pool.query('UPDATE refresh_tokens SET revoked=true WHERE user_id=$1 AND family_id<>$2', [req.user.id, req.auth.sid]);
+    res.json({ ok: true });
+  });
+  app.delete('/api/auth/sessions/:id', authenticate, async (req, res) => {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(req.params.id)) fail(400, 'VALIDATION_ERROR', 'Invalid session ID.');
+    const result = await pool.query('UPDATE refresh_tokens SET revoked=true WHERE user_id=$1 AND family_id=$2 RETURNING family_id', [req.user.id, req.params.id]);
+    if (!result.rowCount) fail(404, 'NOT_FOUND', 'Session not found.');
+    if (req.params.id === req.auth.sid) clear(res);
+    res.json({ ok: true });
   });
   app.patch('/api/me', authenticate, async (req, res) => {
     const { rows: [user] } = await pool.query('UPDATE users SET display_name=$1 WHERE id=$2 RETURNING *', [text(req.body.displayName, 'Display name', 80), req.user.id]);
