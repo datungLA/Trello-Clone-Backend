@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { fail, text } from './auth.js';
 import { transaction } from './db.js';
+import { notifyCard } from './notifications.js';
 
 export const cardExtras = row => ({ labelIds: row.label_ids || [], assigneeIds: row.assignee_ids || [], coverColor: row.cover_color || null, startDate: row.start_date || null, dueDate: row.due_date || null, completed: row.completed || false });
 export async function logActivity(client, card, userId, action) {
@@ -9,8 +10,8 @@ export async function logActivity(client, card, userId, action) {
 export async function cardDetails(client, cardId) {
   const checklists = (await client.query('SELECT id,title,position FROM checklists WHERE card_id=$1 ORDER BY position,id', [cardId])).rows;
   const items = (await client.query('SELECT i.* FROM checklist_items i JOIN checklists c ON c.id=i.checklist_id WHERE c.card_id=$1 ORDER BY i.position,i.id', [cardId])).rows;
-  const comments = (await client.query('SELECT c.id,c.body,c.user_id AS "userId",u.display_name AS "displayName",c.created_at AS "createdAt",c.updated_at AS "updatedAt" FROM comments c JOIN users u ON u.id=c.user_id WHERE c.card_id=$1 ORDER BY c.created_at,c.id LIMIT 500', [cardId])).rows;
-  const activity = (await client.query('SELECT a.id,a.action,a.user_id AS "userId",u.display_name AS "displayName",a.created_at AS "createdAt" FROM activity a JOIN users u ON u.id=a.user_id WHERE a.card_id=$1 ORDER BY a.created_at DESC,a.id LIMIT 100', [cardId])).rows;
+  const comments = (await client.query("SELECT c.id,c.body,c.user_id AS \"userId\",coalesce(u.display_name,'Deleted user') AS \"displayName\",c.created_at AS \"createdAt\",c.updated_at AS \"updatedAt\" FROM comments c LEFT JOIN users u ON u.id=c.user_id WHERE c.card_id=$1 ORDER BY c.created_at,c.id LIMIT 500", [cardId])).rows;
+  const activity = (await client.query("SELECT a.id,a.action,a.user_id AS \"userId\",coalesce(u.display_name,'Deleted user') AS \"displayName\",a.created_at AS \"createdAt\" FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE a.card_id=$1 ORDER BY a.created_at DESC,a.id LIMIT 100", [cardId])).rows;
   return { checklists: checklists.map(c => ({ ...c, items: items.filter(i => i.checklist_id === c.id).map(i => ({ id: i.id, title: i.title, completed: i.completed, position: i.position })) })), comments, activity };
 }
 export async function editCardExtras(client, row, body, { id, color, bool }) {
@@ -136,6 +137,7 @@ export function installTaskManagement(app, helpers) {
       const card = await editableCard(client, req.params.id, req.user.id);
       const row = (await client.query('INSERT INTO comments(id,card_id,user_id,body) VALUES($1,$2,$3,$4) RETURNING id,body,user_id AS "userId",created_at AS "createdAt",updated_at AS "updatedAt"', [id(req.body.id), card.id, req.user.id, text(req.body.body, 'Comment', 10000)])).rows[0];
       await logActivity(client, card, req.user.id, 'comment.created');
+      await notifyCard(client, card, req.user.id, 'comment', card.assignee_ids);
       return { ...row, displayName: req.user.display_name };
     });
     res.status(201).json(value);

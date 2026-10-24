@@ -6,6 +6,7 @@ import { installAuth, fail, text, email, hash, secretToken } from './auth.js';
 import { transaction } from './db.js';
 import { installAdmin, installArchiveGuard, workspaceActive } from './admin.js';
 import { installTaskManagement, cardExtras, cardDetails, editCardExtras, logActivity } from './tasks.js';
+import { installNotifications, notifyCard } from './notifications.js';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function id(value) {
@@ -261,6 +262,7 @@ export function createApp({ pool, redis, config }) {
       if (list.archived) fail(409, 'LIST_ARCHIVED', 'Restore the parent list before editing its cards.');
       if (req.body.description !== undefined && (typeof req.body.description !== 'string' || req.body.description.length > 20000)) fail(400, 'VALIDATION_ERROR', 'Description must be text up to 20000 characters.');
       await editCardExtras(client, row, req.body, { id, color, bool });
+      if (req.body.assigneeIds) await notifyCard(client, row, req.user.id, 'assigned', req.body.assigneeIds.filter(value => !row.assignee_ids.includes(value)));
       await logActivity(client, row, req.user.id, 'card.updated');
       return (await client.query('UPDATE cards SET title=$1,description=$2,archived=$3 WHERE id=$4 RETURNING *', [req.body.title === undefined ? row.title : text(req.body.title, 'Card title', 200), req.body.description ?? row.description, req.body.archived === undefined ? row.archived : bool(req.body.archived, 'Archived'), row.id])).rows[0];
     });
@@ -290,6 +292,7 @@ export function createApp({ pool, redis, config }) {
     });
     res.json(cardData(card));
   });
+  installNotifications(app, { pool });
   installAdmin(app, { pool, id, bool });
   installTaskManagement(app, { pool, membership, boardAccess, listAccess, cardAccess, id, color, bool, position, cardData, listData, boardData });
   app.use((req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }));

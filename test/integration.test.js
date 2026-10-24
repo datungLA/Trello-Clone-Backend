@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createClient } from 'redis';
@@ -197,6 +197,67 @@ test('refresh replay after grace revokes every access and refresh token for the 
 });
 
 
+test('profile appearance persists and deletion requires reauthentication while retaining shared content', async () => {
+  const owner = await account('profile-owner'), member = await account('profile-member');
+  assert.equal((await owner.request('/auth/me')).theme, 'system');
+  await owner.request('/me', { method: 'PATCH', body: { displayName: 'New display name', theme: 'dark' } });
+  const profile = await owner.request('/auth/me');
+  assert.equal(profile.displayName, 'New display name');
+  assert.equal(profile.theme, 'dark');
+  await owner.request('/me', { method: 'PATCH', status: 400, body: { theme: 'invalid' } });
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Retained work' } });
+  const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Shared board' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Todo' } });
+  const card = await owner.request(`/lists/${list.id}/cards`, { method: 'POST', status: 201, body: { title: 'Retain me' } });
+  await owner.request(`/cards/${card.id}/comments`, { method: 'POST', status: 201, body: { body: 'Shared context' } });
+  await owner.request('/me', { method: 'DELETE', status: 400 });
+  await owner.request('/me', { method: 'DELETE', status: 403, body: { confirm: 'DELETE', password: 'wrong' } });
+  assert.equal((await owner.request('/auth/me')).id, owner.user.id);
+  await owner.request('/me', { method: 'DELETE', status: 409, body: { confirm: 'DELETE', password: 'learning-password-123' } });
+  await owner.request(`/workspaces/${workspace.id}/transfer`, { method: 'POST', body: { userId: member.user.id } });
+  await owner.request('/me', { method: 'DELETE', body: { confirm: 'DELETE', password: 'learning-password-123' } });
+  await owner.request('/auth/me', { status: 401 });
+  const detail = await member.request(`/cards/${card.id}`);
+  assert.equal(detail.comments[0].body, 'Shared context');
+  assert.equal(detail.comments[0].displayName, 'Deleted user');
+  assert.equal(detail.comments[0].userId, null);
+});
+
+test('assignment and comment notifications are private, deduplicated, readable and scoped to current membership', async () => {
+  const owner = await account('notify-owner'), member = await account('notify-member'), outsider = await account('notify-outsider');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Notifications' } });
+  const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Inbox' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Todo' } });
+  const card = await owner.request(`/lists/${list.id}/cards`, { method: 'POST', status: 201, body: { title: 'Review UI' } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { assigneeIds: [member.user.id] } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { assigneeIds: [member.user.id] } });
+  let inbox = await member.request('/notifications');
+  assert.equal(inbox.unreadCount, 1);
+  const first = inbox.items[0];
+  assert.equal(first.kind, 'assigned');
+  assert.equal(first.cardTitle, 'Review UI');
+  assert.equal((await outsider.request('/notifications')).items.length, 0);
+  await outsider.request(`/notifications/${first.id}`, { method: 'PATCH', status: 404, body: { read: true } });
+  await outsider.request(`/notifications/${first.id}`, { method: 'DELETE', status: 404 });
+  await member.request(`/notifications/${first.id}`, { method: 'PATCH', body: { read: true } });
+  assert.equal((await member.request('/notifications')).unreadCount, 0);
+  await owner.request(`/cards/${card.id}/comments`, { method: 'POST', status: 201, body: { body: 'Please review' } });
+  await member.request(`/cards/${card.id}/comments`, { method: 'POST', status: 201, body: { body: 'On it' } });
+  inbox = await member.request('/notifications');
+  assert.equal(inbox.items.length, 2);
+  assert.equal(inbox.unreadCount, 1);
+  await member.request('/notifications/read-all', { method: 'PATCH' });
+  assert.equal((await member.request('/notifications')).unreadCount, 0);
+  await member.request(`/notifications/${first.id}`, { method: 'DELETE' });
+  assert.equal((await member.request('/notifications')).items.length, 1);
+  await owner.request(`/workspaces/${workspace.id}/members/${member.user.id}`, { method: 'DELETE' });
+  assert.equal((await member.request('/notifications')).items.length, 0);
+});
+
 test('rich card metadata, checklists, comments and saved views preserve authorization', async () => {
   const owner = await account('tasks-owner'), member = await account('tasks-member'), outsider = await account('tasks-outsider');
   const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Task workspace' } });
@@ -330,7 +391,8 @@ test('upgrade from core schema preserves existing card data and migration is rep
     assert.equal(row.completed, false);
     assert.equal(row.due_date, null);
     assert.equal((await client.query('SELECT wip_limit FROM lists WHERE id=$1', [listId])).rows[0].wip_limit, null);
-    assert.equal((await client.query('SELECT count(*)::int AS count FROM schema_migrations')).rows[0].count, 3);
+    const migrations = (await readdir(new URL('../migrations/', import.meta.url))).filter(name => /^\d+_[\w-]+\.sql$/.test(name));
+    assert.equal((await client.query('SELECT count(*)::int AS count FROM schema_migrations')).rows[0].count, migrations.length);
     assert.equal((await client.query('SELECT archived FROM workspaces WHERE id=$1', [workspaceId])).rows[0].archived, false);
   } finally {
     await client.query('RESET search_path');

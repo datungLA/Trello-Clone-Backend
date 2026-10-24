@@ -6,7 +6,7 @@ import { transaction } from './db.js';
 
 export const hash = value => createHash('sha256').update(value).digest('hex');
 export const secretToken = () => randomBytes(32).toString('base64url');
-export const publicUser = row => ({ id: row.id, email: row.email, displayName: row.display_name, isAdmin: row.is_admin === true });
+export const publicUser = row => ({ id: row.id, email: row.email, displayName: row.display_name, isAdmin: row.is_admin === true, theme: row.theme || 'system' });
 export function fail(status, code, message) { throw Object.assign(new Error(message), { status, code }); }
 export function text(value, name, max = 200) {
   if (typeof value !== 'string' || !value.trim() || value.trim().length > max) fail(400, 'VALIDATION_ERROR', `${name} is required (maximum ${max} characters).`);
@@ -176,8 +176,32 @@ export function installAuth(app, { pool, redis, config }) {
     res.json({ ok: true });
   });
   app.patch('/api/me', authenticate, async (req, res) => {
-    const { rows: [user] } = await pool.query('UPDATE users SET display_name=$1 WHERE id=$2 RETURNING *', [text(req.body.displayName, 'Display name', 80), req.user.id]);
+    if (req.body.theme !== undefined && !['system','light','dark'].includes(req.body.theme)) fail(400, 'VALIDATION_ERROR', 'Choose system, light, or dark appearance.');
+    const displayName = req.body.displayName === undefined ? req.user.display_name : text(req.body.displayName, 'Display name', 80);
+    const theme = req.body.theme === undefined ? req.user.theme || 'system' : req.body.theme;
+    const { rows: [user] } = await pool.query('UPDATE users SET display_name=$1,theme=$2 WHERE id=$3 RETURNING *', [displayName, theme, req.user.id]);
     res.json(publicUser(user));
+  });
+  app.delete('/api/me', authenticate, async (req, res) => {
+    if (req.body.confirm !== 'DELETE') fail(400, 'CONFIRM_REQUIRED', 'Type DELETE to confirm account deletion.');
+    if (typeof req.body.password !== 'string' || !await bcrypt.compare(req.body.password, req.user.password_hash)) fail(403, 'REAUTH_REQUIRED', 'Your password is incorrect. Try again.');
+    await transaction(pool, async client => {
+      await client.query('SELECT pg_advisory_xact_lock(721544)');
+      const { rows: [user] } = await client.query('SELECT * FROM users WHERE id=$1 FOR UPDATE', [req.user.id]);
+      const owned = await client.query("SELECT 1 FROM memberships WHERE user_id=$1 AND role='owner' LIMIT 1", [user.id]);
+      if (owned.rowCount) fail(409, 'OWNED_WORKSPACES', 'Transfer ownership of every workspace before deleting this account.');
+      if (user.is_admin) {
+        const admins = await client.query('SELECT count(*)::int AS count FROM users WHERE is_admin AND suspended_at IS NULL AND id<>$1', [user.id]);
+        if (!admins.rows[0].count) fail(409, 'LAST_ADMIN', 'The last active administrator cannot delete their account.');
+      }
+      await client.query('UPDATE cards SET assignee_ids=array_remove(assignee_ids,$1)', [user.id]);
+      await client.query('UPDATE admin_audit SET actor_id=NULL WHERE actor_id=$1', [user.id]);
+      await client.query('UPDATE invitations SET revoked=true WHERE lower(email)=lower($1) AND accepted_at IS NULL', [user.email]);
+      await client.query('DELETE FROM users WHERE id=$1', [user.id]);
+    });
+    clear(res);
+    await redis.set(`revoked-jti:${req.auth.jti}`, '1', { EX: Math.max(1, req.auth.exp - Math.floor(Date.now() / 1000)) });
+    res.json({ message: 'Account deleted.' });
   });
   return authenticate;
 }
