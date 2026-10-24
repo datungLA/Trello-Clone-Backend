@@ -56,6 +56,16 @@ async function account(name) {
   return Object.assign(client, { user });
 }
 
+test('CSRF bootstrap reports cookie presence without exposing the refresh token', async () => {
+  const client = browser();
+  assert.equal((await client.request('/auth/csrf')).hasSession, false);
+  client.cookies.set('rt', 'not-a-valid-refresh-token');
+  const data = await client.request('/auth/csrf');
+  assert.equal(data.hasSession, true);
+  assert.deepEqual(Object.keys(data).sort(), ['csrfToken', 'hasSession']);
+  await client.request('/auth/renew', { method: 'POST', csrf: data.csrfToken, status: 401 });
+});
+
 test('workspace isolation, invitations, persisted ordering, archives and ownership', async () => {
   const owner = await account('owner');
   const member = await account('member');

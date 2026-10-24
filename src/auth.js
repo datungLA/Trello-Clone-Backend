@@ -52,7 +52,7 @@ export function installAuth(app, { pool, redis, config }) {
   app.get('/api/auth/csrf', (req, res) => {
     const csrfToken = secretToken();
     res.cookie('csrf', csrfToken, { secure: config.secure, sameSite: 'lax', path: '/api/auth' });
-    res.json({ csrfToken });
+    res.json({ csrfToken, hasSession: Boolean(req.cookies[cookieName]) });
   });
   app.use('/api/auth', async (req, res, next) => {
     if (req.method === 'GET' || config.authRateLimit === false) return next();
