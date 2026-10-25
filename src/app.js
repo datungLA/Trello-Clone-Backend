@@ -1,4 +1,5 @@
 import express from 'express';
+import { validateConfig } from './config.js';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import { randomUUID } from 'node:crypto';
@@ -30,8 +31,10 @@ const cardData = row => ({ id: row.id, listId: row.list_id, title: row.title, de
 const boardData = row => ({ id: row.id, workspaceId: row.workspace_id, title: row.title, color: row.color, closed: row.closed, favorite: row.favorite || false, lastOpenedAt: row.last_opened_at || null, workspaceArchived: row.workspace_archived || false });
 
 export function createApp({ pool, redis, config }) {
+  validateConfig(config);
   const app = express();
   app.disable('x-powered-by');
+  app.set('trust proxy', config.trustProxy || false);
   app.use(helmet(), express.json({ limit: '64kb' }), cookieParser());
   app.use((req, res, next) => { req.body ||= {}; next(); });
   app.get(['/health', '/api/health'], async (req, res) => {

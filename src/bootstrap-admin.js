@@ -12,10 +12,11 @@ export async function grantAdministrator(pool, address) {
     if (!user) fail(404, 'NOT_FOUND', 'Register the account before granting administrator access.');
     if (user.suspended_at) fail(409, 'ACCOUNT_SUSPENDED', 'Reactivate this account before granting administrator access.');
     if (!user.is_admin) {
-      await client.query('UPDATE users SET is_admin=true WHERE id=$1', [user.id]);
+      await client.query("UPDATE users SET is_admin=true,app_role=CASE WHEN app_role='super_admin' THEN app_role ELSE 'admin' END WHERE id=$1", [user.id]);
       await audit(client, null, 'user.admin_bootstrapped', 'user', user.id, { source: 'operator-cli' });
     }
-    return adminUser({ ...user, is_admin: true });
+    await client.query('UPDATE bootstrap_state SET completed_at=now() WHERE singleton AND completed_at IS NULL');
+    return adminUser({ ...user, is_admin: true, app_role: user.app_role === 'super_admin' ? 'super_admin' : 'admin' });
   });
 }
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

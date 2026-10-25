@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { fail } from './auth.js';
 import { transaction } from './db.js';
 
-export const adminUser = row => ({ id: row.id, email: row.email, displayName: row.display_name, isAdmin: row.is_admin, suspended: !!row.suspended_at, createdAt: row.created_at });
+export const adminUser = row => ({ id: row.id, email: row.email, displayName: row.display_name, isAdmin: row.is_admin, appRole: row.app_role || (row.is_admin ? 'admin' : 'user'), suspended: !!row.suspended_at, createdAt: row.created_at });
 export async function audit(client, actorId, action, targetType, targetId, details = {}) {
   await client.query('INSERT INTO admin_audit(id,actor_id,action,target_type,target_id,details) VALUES($1,$2,$3,$4,$5,$6)', [randomUUID(), actorId, action, targetType, targetId, JSON.stringify({ ...details, outcome: 'success' })]);
 }
@@ -70,7 +70,7 @@ export function installAdmin(app, { pool, id, bool }) {
     res.json(row);
   });
   app.get('/api/admin/users', async (req, res) => {
-    const result = await page(req, 'SELECT id,email,display_name,is_admin,suspended_at,created_at FROM users WHERE email ILIKE $1 OR display_name ILIKE $1', [search(req)], 'created_at DESC,id');
+    const result = await page(req, 'SELECT id,email,display_name,is_admin,app_role,suspended_at,created_at FROM users WHERE email ILIKE $1 OR display_name ILIKE $1', [search(req)], 'created_at DESC,id');
     res.json({ ...result, items: result.items.map(adminUser) });
   });
   app.patch('/api/admin/users/:id', async (req, res) => {
@@ -86,8 +86,15 @@ export function installAdmin(app, { pool, id, bool }) {
         const remaining = (await client.query('SELECT count(*)::int AS count FROM users WHERE is_admin AND suspended_at IS NULL AND id<>$1', [target.id])).rows[0].count;
         if (!remaining) fail(409, 'LAST_ADMIN', 'The last active application administrator cannot be suspended or removed.');
       }
+      if (target.app_role === 'super_admin') {
+        if (req.user.app_role !== 'super_admin') fail(403, 'FORBIDDEN', 'Only a super administrator can change this account.');
+        if (!isAdmin || suspended) {
+          const remaining = await client.query("SELECT 1 FROM users WHERE app_role='super_admin' AND suspended_at IS NULL AND id<>$1", [target.id]);
+          if (!remaining.rowCount) fail(409, 'LAST_SUPER_ADMIN', 'The last active super administrator cannot be suspended or removed.');
+        }
+      }
       const revoke = (isAdmin !== target.is_admin && !isAdmin) || (suspended && !target.suspended_at);
-      const row = (await client.query('UPDATE users SET is_admin=$1,suspended_at=CASE WHEN $2 THEN COALESCE(suspended_at,now()) ELSE NULL END,token_version=token_version+$3 WHERE id=$4 RETURNING *', [isAdmin, suspended, revoke ? 1 : 0, target.id])).rows[0];
+      const row = (await client.query("UPDATE users SET is_admin=$1,app_role=CASE WHEN NOT $1 THEN 'user' WHEN app_role='super_admin' THEN 'super_admin' ELSE 'admin' END,suspended_at=CASE WHEN $2 THEN COALESCE(suspended_at,now()) ELSE NULL END,token_version=token_version+$3 WHERE id=$4 RETURNING *", [isAdmin, suspended, revoke ? 1 : 0, target.id])).rows[0];
       if (revoke) await client.query('UPDATE refresh_tokens SET revoked=true WHERE user_id=$1', [target.id]);
       await audit(client, req.user.id, 'user.updated', 'user', target.id, { before: { isAdmin: target.is_admin, suspended: !!target.suspended_at }, after: { isAdmin, suspended } });
       return adminUser(row);

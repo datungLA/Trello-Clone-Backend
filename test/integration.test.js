@@ -8,27 +8,31 @@ import { createClient } from 'redis';
 import { database } from '../src/db.js';
 import { migrate } from '../src/migrate.js';
 import { createApp } from '../src/app.js';
+import { hash } from '../src/auth.js';
 import { grantAdministrator } from '../src/bootstrap-admin.js';
+import { boundedMailQueue } from '../src/mail.js';
 
 if (!process.env.TEST_DATABASE_URL) throw new Error('TEST_DATABASE_URL is required; use a disposable test database.');
 const pool = database(process.env.TEST_DATABASE_URL);
 const redis = createClient({ url: process.env.REDIS_URL });
 let server, base, mailDir;
+const mailQueue = boundedMailQueue();
 before(async () => {
   await redis.connect();
   await migrate(pool);
   mailDir = await mkdtemp(join(tmpdir(), 'trello-mail-'));
-  server = createApp({ pool, redis, config: { jwtSecret: 'test-secret-with-more-than-thirty-two-characters', origin: 'http://localhost:8080', secure: false, nodeEnv: 'test', devMailDir: mailDir, authRateLimit: false } }).listen(0, '127.0.0.1');
+  server = createApp({ pool, redis, config: { jwtSecret: 'test-secret-with-more-than-thirty-two-characters', origin: 'http://localhost:8080', secure: false, nodeEnv: 'test', devMailDir: mailDir, mailQueue, authRateLimit: false } }).listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
   base = `http://127.0.0.1:${server.address().port}/api`;
 });
 after(async () => {
+  await mailQueue.drain();
   if (server) await new Promise(resolve => server.close(resolve));
   await pool.end();
   if (redis.isOpen) await redis.quit();
   if (mailDir) await rm(mailDir, { recursive: true, force: true });
 });
-function browser() {
+function browser(root = base) {
   return {
     cookies: new Map(), token: null,
     async request(path, { method = 'GET', body, status = 200, csrf } = {}) {
@@ -36,7 +40,7 @@ function browser() {
       if (this.token) headers.Authorization = `Bearer ${this.token}`;
       if (csrf) headers['X-CSRF-Token'] = csrf;
       headers.Cookie = [...this.cookies].map(([key, value]) => `${key}=${value}`).join('; ');
-      const result = await fetch(`${base}${path}`, { method, headers, ...(method !== 'GET' ? { body: JSON.stringify(body || {}) } : {}) });
+      const result = await fetch(`${root}${path}`, { method, headers, ...(method !== 'GET' ? { body: JSON.stringify(body || {}) } : {}) });
       for (const cookie of result.headers.getSetCookie()) {
         const [pair] = cookie.split(';');
         const split = pair.indexOf('=');
@@ -52,7 +56,13 @@ function browser() {
 const suffix = randomUUID();
 async function account(name) {
   const client = browser();
-  const user = (await client.request('/auth/register', { method: 'POST', status: 201, body: { email: `${name}-${suffix}@example.com`, password: 'learning-password-123', displayName: name } })).user;
+  const address = `${name}-${suffix}@example.com`;
+  await client.request('/auth/register', { method: 'POST', status: 202, body: { email: address, password: 'learning-password-123', displayName: name } });
+  await mailQueue.drain();
+  const row = (await pool.query('SELECT id FROM users WHERE email=$1', [address])).rows[0];
+  const message = JSON.parse(await readFile(join(mailDir, `${row.id}.verify.json`), 'utf8'));
+  await client.request('/auth/verify-email', { method: 'POST', body: { token: new URL(message.resetUrl).searchParams.get('token') } });
+  const user = (await client.request('/auth/login', { method: 'POST', body: { email: address, password: 'learning-password-123' } })).user;
   return Object.assign(client, { user });
 }
 
@@ -148,6 +158,7 @@ test('renew rotation, CSRF, logout revocation and password reset invalidate cred
   const response = await client.request('/auth/forgot-password', { method: 'POST', body: { email: client.user.email } });
   const unknown = await client.request('/auth/forgot-password', { method: 'POST', body: { email: `unknown-${suffix}@example.com` } });
   assert.deepEqual(response, unknown);
+  await mailQueue.drain();
   const preview = JSON.parse(await readFile(join(mailDir, `${client.user.id}.json`), 'utf8'));
   const resetToken = new URL(preview.resetUrl).searchParams.get('token');
   await client.request('/auth/reset-password', { method: 'POST', body: { token: resetToken, newPassword: 'new-learning-password-456' } });
@@ -374,6 +385,8 @@ test('upgrade from core schema preserves existing card data and migration is rep
     await client.query(await readFile(new URL('../migrations/001_init.sql', import.meta.url), 'utf8'));
     await client.query('CREATE TABLE schema_migrations(name text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now())');
     await client.query("INSERT INTO schema_migrations(name) VALUES('001_init.sql')");
+    const legacyUser = randomUUID();
+    await client.query('INSERT INTO users(id,email,display_name,password_hash) VALUES($1,$2,$3,$4)', [legacyUser, 'legacy@example.com', 'Legacy learner', 'unused']);
     const workspaceId = randomUUID(), boardId = randomUUID(), listId = randomUUID(), cardId = randomUUID();
     await client.query('INSERT INTO workspaces(id,name) VALUES($1,$2)', [workspaceId, 'Existing workspace']);
     await client.query('INSERT INTO boards(id,workspace_id,title) VALUES($1,$2,$3)', [boardId, workspaceId, 'Existing board']);
@@ -382,6 +395,7 @@ test('upgrade from core schema preserves existing card data and migration is rep
     const scopedPool = { connect: async () => ({ query: client.query.bind(client), release() {} }) };
     await migrate(scopedPool);
     await migrate(scopedPool);
+    assert.ok((await client.query('SELECT email_verified_at FROM users WHERE id=$1', [legacyUser])).rows[0].email_verified_at);
     const row = (await client.query('SELECT * FROM cards WHERE id=$1', [cardId])).rows[0];
     assert.equal(row.description, 'Preserve me');
     assert.equal(row.position, 2);
@@ -450,6 +464,7 @@ test('suspension immediately invalidates access and renewal; restoration require
   await user.request('/auth/renew', { method: 'POST', status: 401, csrf: csrfToken });
   await user.request('/auth/login', { method: 'POST', status: 403, body: { email: user.user.email, password: 'learning-password-123' } });
   await user.request('/auth/forgot-password', { method: 'POST', body: { email: user.user.email } });
+  await mailQueue.drain();
   const preview = JSON.parse(await readFile(join(mailDir, `${user.user.id}.json`), 'utf8'));
   await user.request('/auth/reset-password', { method: 'POST', body: { token: new URL(preview.resetUrl).searchParams.get('token'), newPassword: 'new-suspended-password-123' } });
   await user.request('/auth/login', { method: 'POST', status: 403, body: { email: user.user.email, password: 'new-suspended-password-123' } });
@@ -539,4 +554,134 @@ test('session inventory and revocation never expose credentials or another user 
   assert.equal(sessions[0].id, currentId);
   await user.request(`/auth/sessions/${currentId}`, { method: 'DELETE' });
   await user.request('/auth/me', { status: 401 });
+});
+
+test('new accounts require single-use verification; registration stays generic and issues no session', async () => {
+  const client = browser(), address = `verify-${suffix}@example.com`;
+  const body = { email: address, password: 'learning-password-123', displayName: 'Verify learner' };
+  const first = await client.request('/auth/register', { method: 'POST', status: 202, body });
+  await mailQueue.drain();
+  const duplicate = await client.request('/auth/register', { method: 'POST', status: 202, body });
+  assert.deepEqual(first, duplicate);
+  assert.equal(client.token, null);
+  assert.equal(client.cookies.has('rt'), false);
+  await client.request('/auth/login', { method: 'POST', status: 403, body });
+  await mailQueue.drain();
+  const user = (await pool.query('SELECT * FROM users WHERE email=$1', [address])).rows[0];
+  const message = JSON.parse(await readFile(join(mailDir, `${user.id}.verify.json`), 'utf8'));
+  let token = new URL(message.resetUrl).searchParams.get('token');
+  await pool.query("UPDATE email_verifications SET expires_at=now()-interval '1 second' WHERE token_hash=$1", [hash(token)]);
+  await client.request('/auth/verify-email', { method: 'POST', status: 400, body: { token } });
+  await client.request('/auth/resend-verification', { method: 'POST', body: { email: address } });
+  await mailQueue.drain();
+  token = new URL(JSON.parse(await readFile(join(mailDir, `${user.id}.verify.json`), 'utf8')).resetUrl).searchParams.get('token');
+  assert.equal((await pool.query('SELECT 1 FROM email_verifications WHERE token_hash=$1', [token])).rowCount, 0);
+  await client.request('/auth/verify-email', { method: 'POST', body: { token } });
+  await client.request('/auth/verify-email', { method: 'POST', status: 400, body: { token } });
+  await client.request('/auth/login', { method: 'POST', body });
+  const audits = (await pool.query('SELECT * FROM auth_audit WHERE user_id=$1', [user.id])).rows;
+  assert.ok(audits.some(row => row.action === 'auth.email.verified'));
+  assert.doesNotMatch(JSON.stringify(audits), new RegExp(`${token}|learning-password|${address}`));
+});
+
+test('password change and explicit logout-all revoke every access and refresh session', async () => {
+  const first = await account('password-change'), second = browser();
+  const credentials = { email: first.user.email, password: 'learning-password-123' };
+  await second.request('/auth/login', { method: 'POST', body: credentials });
+  await first.request('/auth/change-password', { method: 'POST', status: 403, body: { currentPassword: 'incorrect-password', newPassword: 'new-learning-password-456' } });
+  await first.request('/auth/change-password', { method: 'POST', body: { currentPassword: credentials.password, newPassword: 'new-learning-password-456' } });
+  for (const client of [first, second]) {
+    await client.request('/auth/me', { status: 401 });
+    const { csrfToken } = await client.request('/auth/csrf');
+    await client.request('/auth/renew', { method: 'POST', csrf: csrfToken, status: 401 });
+    await client.request('/auth/login', { method: 'POST', body: { ...credentials, password: 'new-learning-password-456' } });
+  }
+  await first.request('/auth/logout-all', { method: 'POST', status: 400 });
+  await first.request('/auth/logout-all', { method: 'POST', body: { confirm: true } });
+  for (const client of [first, second]) await client.request('/auth/me', { status: 401 });
+});
+
+test('rate limits normalize identifiers, enforce minute/hour budgets and exponential login cooldown', async () => {
+  const prefix = `test-${randomUUID()}`;
+  const limited = createApp({ pool, redis, config: { jwtSecret: 'test-secret-with-more-than-thirty-two-characters', origin: 'http://localhost:8080', nodeEnv: 'test', secure: false, authRatePrefix: prefix, trustProxy: 1 } }).listen(0, '127.0.0.1');
+  await new Promise(resolve => limited.once('listening', resolve));
+  const endpoint = `http://127.0.0.1:${limited.address().port}/api/auth`;
+  const request = (path, address, ip = '192.0.2.10') => fetch(`${endpoint}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': ip }, body: JSON.stringify({ email: address, password: 'wrong-password-123' }) });
+  const address = `rate-${suffix}@example.com`;
+  const clearMinute = async (path, ip = '192.0.2.10') => {
+    for (const scope of [`ip:${ip}`, `email:${hash(address)}`]) await redis.del(`${prefix}-rate:${hash(`${scope}:${path}:60`)}`);
+  };
+  try {
+    assert.equal((await request('/forgot-password', `  ${address.toUpperCase()}  `)).status, 200);
+    const throttled = await request('/forgot-password', address, '192.0.2.11');
+    assert.equal(throttled.status, 429);
+    assert.ok(Number(throttled.headers.get('Retry-After')) > 0);
+    for (let i = 0; i < 2; i++) { await clearMinute('/forgot-password'); assert.equal((await request('/forgot-password', address)).status, 200); }
+    await clearMinute('/forgot-password');
+    assert.equal((await request('/forgot-password', address)).status, 429);
+    for (let i = 0; i < 5; i++) { await clearMinute('/resend-verification'); assert.equal((await request('/resend-verification', address)).status, 200); }
+    await clearMinute('/resend-verification');
+    assert.equal((await request('/resend-verification', address)).status, 429);
+    for (let i = 0; i < 5; i++) assert.equal((await request('/login', i % 2 ? address : ` ${address.toUpperCase()} `)).status, 401);
+    const blocked = await request('/login', address, '192.0.2.12');
+    assert.equal(blocked.status, 429);
+    assert.ok(Number(blocked.headers.get('Retry-After')) >= 900);
+    const audit = await pool.query("SELECT 1 FROM auth_audit WHERE action='auth.throttled' AND identifier_hash=$1", [hash(address)]);
+    assert.ok(audit.rowCount > 0);
+  } finally {
+    await new Promise(resolve => limited.close(resolve));
+    const keys = [];
+    for await (const key of redis.scanIterator({ MATCH: `${prefix}-*`, COUNT: 100 })) keys.push(...(Array.isArray(key) ? key : [key]));
+    if (keys.length) await redis.del(keys);
+  }
+});
+
+test('bootstrap is atomic, survives restart/deletion, protects final super admin and preserves private board scope', async () => {
+  const schema = `bootstrap_${randomUUID().replaceAll('-', '')}`;
+  await pool.query(`CREATE SCHEMA ${schema}`);
+  const url = new URL(process.env.TEST_DATABASE_URL);
+  url.searchParams.set('options', `-csearch_path=${schema}`);
+  const isolated = database(url.toString());
+  const configuration = { jwtSecret: 'test-secret-with-more-than-thirty-two-characters', origin: 'http://localhost:8080', secure: false, nodeEnv: 'test', setupToken: 'test-setup-token-more-than-thirty-two-characters', authRateLimit: false };
+  let setupServer;
+  const start = async () => {
+    setupServer = createApp({ pool: isolated, redis, config: configuration }).listen(0, '127.0.0.1');
+    await new Promise(resolve => setupServer.once('listening', resolve));
+    return `http://127.0.0.1:${setupServer.address().port}/api`;
+  };
+  try {
+    await migrate(isolated);
+    let root = await start();
+    const setup = browser(root);
+    assert.deepEqual(await setup.request('/auth/bootstrap/status'), { available: true });
+    await setup.request('/auth/bootstrap/register', { method: 'POST', status: 404, body: { setupToken: 'incorrect' } });
+    const body = { setupToken: configuration.setupToken, email: `super-${suffix}@example.com`, password: 'learning-password-123', displayName: 'Owner' };
+    const results = await Promise.all([1, 2].map(index => fetch(`${root}/auth/bootstrap/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, email: `super-${index}-${suffix}@example.com` }) })));
+    assert.deepEqual(results.map(result => result.status).sort(), [201, 404]);
+    const created = await results.find(result => result.status === 201).json();
+    assert.equal(created.user.appRole, 'super_admin');
+    assert.equal(created.user.isAdmin, true);
+    setup.token = created.accessToken;
+    await setup.request(`/admin/users/${created.user.id}`, { method: 'PATCH', status: 409, body: { suspended: true, confirm: true } });
+    await setup.request('/me', { method: 'DELETE', status: 409, body: { confirm: 'DELETE', password: body.password } });
+    const privateOwner = randomUUID(), privateWorkspace = randomUUID(), privateBoard = randomUUID();
+    await isolated.query('INSERT INTO users(id,email,display_name,password_hash,email_verified_at) VALUES($1,$2,$3,$4,now())', [privateOwner, 'private@example.com', 'Private owner', 'unused']);
+    await isolated.query('INSERT INTO workspaces(id,name) VALUES($1,$2)', [privateWorkspace, 'Private workspace']);
+    await isolated.query("INSERT INTO memberships(workspace_id,user_id,role) VALUES($1,$2,'owner')", [privateWorkspace, privateOwner]);
+    await isolated.query('INSERT INTO boards(id,workspace_id,title) VALUES($1,$2,$3)', [privateBoard, privateWorkspace, 'Private board']);
+    await setup.request(`/boards/${privateBoard}`, { status: 404 });
+    await setup.request('/auth/bootstrap/status', { status: 404 });
+    await assert.rejects(isolated.query('UPDATE bootstrap_state SET completed_at=NULL'));
+    await assert.rejects(isolated.query('DELETE FROM bootstrap_state'));
+    await isolated.query('DELETE FROM users WHERE id=$1', [created.user.id]);
+    await new Promise(resolve => setupServer.close(resolve));
+    root = await start();
+    const restarted = browser(root);
+    await restarted.request('/auth/bootstrap/status', { status: 404 });
+    await restarted.request('/auth/bootstrap/register', { method: 'POST', status: 404, body });
+  } finally {
+    if (setupServer) await new Promise(resolve => setupServer.close(resolve));
+    await isolated.end();
+    await pool.query(`DROP SCHEMA ${schema} CASCADE`);
+  }
 });
