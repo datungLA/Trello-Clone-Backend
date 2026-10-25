@@ -9,6 +9,8 @@ const config = {
   secure: process.env.COOKIE_SECURE === 'true',
   nodeEnv: process.env.NODE_ENV || 'development',
   devMailDir: process.env.DEV_MAIL_DIR,
+  resendApiKey: process.env.RESEND_API_KEY,
+  mailFrom: process.env.MAIL_FROM,
 };
 if (!config.jwtSecret || config.jwtSecret.length < 32) throw new Error('JWT_SECRET must contain at least 32 characters.');
 if (config.nodeEnv === 'production' && !config.secure) throw new Error('Production requires secure cookies.');

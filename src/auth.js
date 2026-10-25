@@ -1,8 +1,8 @@
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { transaction } from './db.js';
+import { resetDelivery } from './mail.js';
 
 export const hash = value => createHash('sha256').update(value).digest('hex');
 export const secretToken = () => randomBytes(32).toString('base64url');
@@ -23,6 +23,7 @@ export function password(value) {
 }
 
 export function installAuth(app, { pool, redis, config }) {
+  const deliverReset = resetDelivery(config);
   const cookieName = config.secure ? '__Secure-rt' : 'rt';
   const cookieOptions = { httpOnly: true, secure: config.secure, sameSite: 'lax', path: '/api/auth', maxAge: 604800000 };
   const dummyHash = bcrypt.hashSync('dummy-password-for-timing-only', 12);
@@ -137,13 +138,16 @@ export function installAuth(app, { pool, redis, config }) {
   app.post('/api/auth/forgot-password', async (req, res) => {
     const normalized = email(req.body.email);
     const { rows: [user] } = await pool.query('SELECT id FROM users WHERE email=$1', [normalized]);
-    if (user && config.devMailDir && config.nodeEnv !== 'production') {
+    if (user && deliverReset) {
       const raw = secretToken();
-      await pool.query('INSERT INTO password_resets(token_hash,user_id,expires_at) VALUES($1,$2,now()+interval \'30 minutes\')', [hash(raw), user.id]);
-      await mkdir(config.devMailDir, { recursive: true, mode: 0o700 });
-      await writeFile(`${config.devMailDir}/${user.id}.json`, JSON.stringify({ to: normalized, resetUrl: `${config.origin}/reset-password?token=${raw}` }), { mode: 0o600 });
+      const tokenHash = hash(raw);
+      await pool.query('INSERT INTO password_resets(token_hash,user_id,expires_at) VALUES($1,$2,now()+interval \'30 minutes\')', [tokenHash, user.id]);
+      const url = new URL('/reset-password', config.origin);
+      url.searchParams.set('token', raw);
+      try { await deliverReset({ to: normalized, userId: user.id, resetUrl: url.toString(), tokenHash }); }
+      catch { console.error('Password reset email delivery failed.'); }
     }
-    res.json({ message: 'If the account exists, reset instructions have been delivered to the Dev mailbox.' });
+    res.json({ message: 'If the account exists, password-reset instructions will be sent. Check your inbox and spam folder.' });
   });
   app.post('/api/auth/reset-password', async (req, res) => {
     const raw = text(req.body.token, 'Token', 200);
