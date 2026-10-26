@@ -118,6 +118,47 @@ test('my tasks follows assignment and current membership across active workspace
   finally { await pool.query("UPDATE users SET is_admin=false,app_role='user' WHERE id=$1", [outsider.user.id]); }
 });
 
+test('board dashboard counts active cards without double-counting totals or exposing private boards', async () => {
+  const owner = await account('dashboard-owner'), member = await account('dashboard-member'), outsider = await account('dashboard-outsider');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Dashboard workspace' } });
+  const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Dashboard board' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Active' } });
+  const empty = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Empty' } });
+  const hidden = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Archived' } });
+  for (const [title, dueDate, completed, assigneeIds, listId, archived] of [
+    ['Late', '2026-10-24', false, [owner.user.id, member.user.id], list.id, false],
+    ['Done', '2026-10-24', true, [member.user.id], list.id, false],
+    ['Today', '2026-10-25', false, [owner.user.id], list.id, false],
+    ['Later', '2026-10-26', false, [], list.id, false],
+    ['Undated', null, false, [], list.id, false],
+    ['Hidden card', null, false, [owner.user.id], list.id, true],
+    ['Hidden list', null, false, [owner.user.id], hidden.id, false],
+  ]) {
+    const card = await owner.request(`/lists/${listId}/cards`, { method: 'POST', status: 201, body: { title } });
+    await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { dueDate, completed, assigneeIds, archived } });
+  }
+  await owner.request(`/lists/${hidden.id}`, { method: 'PATCH', body: { archived: true } });
+  const endpoint = `/boards/${board.id}/dashboard?today=2026-10-25`;
+  const result = await member.request(endpoint);
+  assert.deepEqual({ total: result.total, completed: result.completed, incomplete: result.incomplete, overdue: result.overdue, undated: result.undated, asOf: result.asOf }, { total: 5, completed: 1, incomplete: 4, overdue: 1, undated: 1, asOf: '2026-10-25' });
+  assert.deepEqual(result.byList.map(({ id, total }) => ({ id, total })), [{ id: list.id, total: 5 }, { id: empty.id, total: 0 }]);
+  assert.deepEqual(result.unassigned, { total: 2, completed: 0, overdue: 0 });
+  assert.equal(result.byAssignee.find(x => x.id === owner.user.id).total, 2);
+  assert.equal(result.byAssignee.find(x => x.id === member.user.id).completed, 1);
+  assert.equal(result.byAssignee.find(x => x.id === member.user.id).overdue, 1);
+  await browser().request(endpoint, { status: 401 });
+  await outsider.request(endpoint, { status: 404 });
+  for (const today of ['2026-02-30', 'invalid', '2026-10-25&today=2026-10-26']) await owner.request(`/boards/${board.id}/dashboard?today=${today}`, { status: 400 });
+  await owner.request(`/boards/${board.id}`, { method: 'PATCH', body: { closed: true } });
+  assert.equal((await owner.request(endpoint)).total, 5);
+  await pool.query('DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2', [workspace.id, member.user.id]);
+  await member.request(endpoint, { status: 404 });
+  await pool.query('UPDATE workspaces SET archived=true WHERE id=$1', [workspace.id]);
+  await owner.request(endpoint, { status: 409 });
+});
+
 test('CSRF bootstrap reports cookie presence without exposing the refresh token', async () => {
   const client = browser();
   assert.equal((await client.request('/auth/csrf')).hasSession, false);

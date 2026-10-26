@@ -55,6 +55,35 @@ export function installTaskManagement(app, helpers) {
       ORDER BY c.completed,c.due_date NULLS LAST,c.id`, [req.user.id]);
     res.json(rows);
   });
+  app.get('/api/boards/:id/dashboard', async (req, res) => {
+    const today = req.query.today ?? new Date().toISOString().slice(0, 10);
+    if (typeof today !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(today) || !Number.isFinite(Date.parse(today)) || new Date(today).toISOString().slice(0, 10) !== today) fail(400, 'VALIDATION_ERROR', 'Use a valid YYYY-MM-DD calendar day.');
+    const value = await transaction(pool, async client => {
+      const board = await boardAccess(client, req.params.id, req.user.id, { lock: true });
+      const lists = (await client.query('SELECT id,title FROM lists WHERE board_id=$1 AND NOT archived ORDER BY position,id', [board.id])).rows;
+      const members = (await client.query('SELECT u.id,u.display_name AS "displayName" FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.workspace_id=$1 ORDER BY u.display_name,u.id', [board.workspace_id])).rows;
+      const cards = (await client.query("SELECT c.completed,c.assignee_ids,to_char(c.due_date AT TIME ZONE 'UTC','YYYY-MM-DD') AS due_date,c.list_id FROM cards c JOIN lists l ON l.id=c.list_id WHERE l.board_id=$1 AND NOT l.archived AND NOT c.archived", [board.id])).rows;
+      const counters = () => ({ total: 0, completed: 0, overdue: 0 });
+      const byList = lists.map(row => ({ ...row, ...counters() }));
+      const byAssignee = members.map(row => ({ ...row, ...counters() }));
+      const listMap = new Map(byList.map(row => [row.id, row]));
+      const memberMap = new Map(byAssignee.map(row => [row.id, row]));
+      const result = { ...counters(), incomplete: 0, undated: 0, byList, byAssignee, unassigned: counters(), asOf: today };
+      const add = (row, card, overdue) => { row.total++; if (card.completed) row.completed++; if (overdue) row.overdue++; };
+      for (const card of cards) {
+        const overdue = !card.completed && !!card.due_date && card.due_date.slice(0, 10) < today;
+        add(result, card, overdue);
+        if (!card.due_date) result.undated++;
+        if (!card.completed) result.incomplete++;
+        add(listMap.get(card.list_id), card, overdue);
+        const assignees = card.assignee_ids.map(id => memberMap.get(id)).filter(Boolean);
+        if (!assignees.length) add(result.unassigned, card, overdue);
+        for (const assignee of assignees) add(assignee, card, overdue);
+      }
+      return result;
+    });
+    res.json(value);
+  });
   async function editableCard(client, cardId, userId) {
     const card = await cardAccess(client, cardId, userId, write);
     const list = (await client.query('SELECT archived FROM lists WHERE id=$1', [card.list_id])).rows[0];
