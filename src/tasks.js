@@ -40,6 +40,21 @@ export async function editCardExtras(client, row, body, { id, color, bool }) {
 export function installTaskManagement(app, helpers) {
   const { pool, membership, boardAccess, listAccess, cardAccess, id, color, bool, position, cardData, listData, boardData } = helpers;
   const write = { lock: true, write: true };
+  app.get('/api/me/tasks', async (req, res) => {
+    const { rows } = await pool.query(`
+      SELECT c.id,c.title,c.start_date AS "startDate",c.due_date AS "dueDate",c.completed,
+        l.id AS "listId",l.title AS "listTitle",b.id AS "boardId",b.title AS "boardTitle",
+        b.color AS "boardColor",w.id AS "workspaceId",w.name AS "workspaceName"
+      FROM cards c
+      JOIN lists l ON l.id=c.list_id
+      JOIN boards b ON b.id=l.board_id
+      JOIN workspaces w ON w.id=b.workspace_id
+      JOIN memberships m ON m.workspace_id=w.id AND m.user_id=$1
+      WHERE $1::uuid=ANY(c.assignee_ids) AND NOT c.archived AND NOT l.archived
+        AND NOT b.closed AND NOT w.archived
+      ORDER BY c.completed,c.due_date NULLS LAST,c.id`, [req.user.id]);
+    res.json(rows);
+  });
   async function editableCard(client, cardId, userId) {
     const card = await cardAccess(client, cardId, userId, write);
     const list = (await client.query('SELECT archived FROM lists WHERE id=$1', [card.list_id])).rows[0];

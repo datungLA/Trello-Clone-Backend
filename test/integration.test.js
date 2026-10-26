@@ -66,6 +66,58 @@ async function account(name) {
   return Object.assign(client, { user });
 }
 
+test('my tasks follows assignment and current membership across active workspaces', async () => {
+  const owner = await account('my-tasks-owner');
+  const member = await account('my-tasks-member');
+  const outsider = await account('my-tasks-outsider');
+  await browser().request('/me/tasks', { status: 401 });
+  const cards = [];
+  const workspaces = [];
+  for (const name of ['First', 'Second']) {
+    const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name } });
+    workspaces.push(workspace);
+    const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+    await member.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+    const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: `${name} board`, color: '#0052cc' } });
+    const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'To do' } });
+    const card = await owner.request(`/lists/${list.id}/cards`, { method: 'POST', status: 201, body: { title: `${name} task` } });
+    await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { assigneeIds: [member.user.id], dueDate: name === 'First' ? '2026-01-01' : null } });
+    cards.push({ ...card, boardId: board.id, listId: list.id });
+  }
+  assert.deepEqual(await owner.request('/me/tasks'), []);
+  assert.deepEqual(await outsider.request('/me/tasks'), []);
+  let result = await member.request('/me/tasks');
+  assert.equal(result.length, 2);
+  assert.equal(result[0].id, cards[0].id);
+  assert.equal(result[0].workspaceName, 'First');
+  assert.equal(result[0].boardTitle, 'First board');
+  assert.equal(result[0].listTitle, 'To do');
+  assert.equal(result[0].dueDate, '2026-01-01T00:00:00.000Z');
+  assert.equal(result[1].dueDate, null);
+  assert.equal(result[0].description, undefined);
+  await member.request(`/cards/${cards[0].id}`, { method: 'PATCH', body: { completed: true } });
+  assert.equal((await member.request('/me/tasks')).find(c => c.id === cards[0].id).completed, true);
+  await owner.request(`/cards/${cards[0].id}`, { method: 'PATCH', body: { archived: true } });
+  assert.equal((await member.request('/me/tasks')).length, 1);
+  await owner.request(`/cards/${cards[0].id}`, { method: 'PATCH', body: { archived: false } });
+  await owner.request(`/lists/${cards[0].listId}`, { method: 'PATCH', body: { archived: true } });
+  assert.equal((await member.request('/me/tasks')).length, 1);
+  await owner.request(`/lists/${cards[0].listId}`, { method: 'PATCH', body: { archived: false } });
+  await owner.request(`/boards/${cards[0].boardId}`, { method: 'PATCH', body: { closed: true } });
+  assert.equal((await member.request('/me/tasks')).length, 1);
+  await owner.request(`/boards/${cards[0].boardId}`, { method: 'PATCH', body: { closed: false } });
+  await pool.query('UPDATE workspaces SET archived=true WHERE id=$1', [workspaces[0].id]);
+  assert.equal((await member.request('/me/tasks')).length, 1);
+  await pool.query('UPDATE workspaces SET archived=false WHERE id=$1', [workspaces[0].id]);
+  await owner.request(`/cards/${cards[1].id}`, { method: 'PATCH', body: { assigneeIds: [] } });
+  assert.equal((await member.request('/me/tasks')).length, 1);
+  await pool.query('DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2', [workspaces[0].id, member.user.id]);
+  assert.deepEqual(await member.request('/me/tasks'), []);
+  await pool.query("UPDATE users SET is_admin=true,app_role='admin' WHERE id=$1", [outsider.user.id]);
+  try { assert.deepEqual(await outsider.request('/me/tasks'), []); }
+  finally { await pool.query("UPDATE users SET is_admin=false,app_role='user' WHERE id=$1", [outsider.user.id]); }
+});
+
 test('CSRF bootstrap reports cookie presence without exposing the refresh token', async () => {
   const client = browser();
   assert.equal((await client.request('/auth/csrf')).hasSession, false);
