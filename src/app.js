@@ -113,6 +113,8 @@ export function createApp({ pool, redis, config }) {
       }
       await client.query('DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
       await client.query('UPDATE cards SET assignee_ids=array_remove(assignee_ids,$1) WHERE list_id IN(SELECT l.id FROM lists l JOIN boards b ON b.id=l.board_id WHERE b.workspace_id=$2)', [req.params.userId, req.params.id]);
+      await client.query('UPDATE invitations SET revoked=true WHERE workspace_id=$1 AND email=(SELECT email FROM users WHERE id=$2) AND accepted_at IS NULL', [req.params.id, req.params.userId]);
+      await client.query('INSERT INTO workspace_activity(id,workspace_id,user_id,action,target_id) VALUES($1,$2,$3,$4,$5)', [randomUUID(), req.params.id, req.user.id, 'member.removed', req.params.userId]);
     });
     res.json({ message: 'Member removed.' });
   });

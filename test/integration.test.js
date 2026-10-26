@@ -159,6 +159,37 @@ test('board dashboard counts active cards without double-counting totals or expo
   await owner.request(endpoint, { status: 409 });
 });
 
+test('only workspace owners remove members, clear assignments and revoke old pending invitations', async () => {
+  const owner = await account('remove-owner'), adminMember = await account('remove-admin-member'), member = await account('remove-member');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Removal permissions' } });
+  for (const person of [adminMember, member]) {
+    const invite = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: person.user.email } });
+    await person.request('/invitations/accept', { method: 'POST', body: { token: invite.token } });
+  }
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Shared board' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'To do' } });
+  const card = await owner.request(`/lists/${list.id}/cards`, { method: 'POST', status: 201, body: { title: 'Keep shared content' } });
+  await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { assigneeIds: [member.user.id] } });
+  const pending = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await pool.query("UPDATE users SET is_admin=true,app_role='admin' WHERE id=$1", [adminMember.user.id]);
+  try { await adminMember.request(`/workspaces/${workspace.id}/members/${member.user.id}`, { method: 'DELETE', status: 403 }); }
+  finally { await pool.query("UPDATE users SET is_admin=false,app_role='user' WHERE id=$1", [adminMember.user.id]); }
+  await owner.request(`/workspaces/${workspace.id}/members/${owner.user.id}`, { method: 'DELETE', status: 409 });
+  await owner.request(`/workspaces/${workspace.id}/members/${member.user.id}`, { method: 'DELETE' });
+  assert.deepEqual((await owner.request(`/cards/${card.id}`)).assigneeIds, []);
+  assert.equal((await owner.request(`/cards/${card.id}`)).title, 'Keep shared content');
+  assert.equal((await owner.request(`/workspaces/${workspace.id}/members`)).length, 2);
+  for (const path of [`/workspaces/${workspace.id}`, `/boards/${board.id}`, `/cards/${card.id}`]) await member.request(path, { status: 404 });
+  assert.deepEqual(await member.request('/me/tasks'), []);
+  assert.deepEqual((await member.request('/notifications')).items, []);
+  await member.request('/invitations/accept', { method: 'POST', body: { token: pending.token }, status: 400 });
+  const log = (await pool.query("SELECT user_id,target_id FROM workspace_activity WHERE workspace_id=$1 AND action='member.removed'", [workspace.id])).rows;
+  assert.deepEqual(log, [{ user_id: owner.user.id, target_id: member.user.id }]);
+  const fresh = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: fresh.token } });
+  assert.equal((await member.request(`/boards/${board.id}`)).id, board.id);
+});
+
 test('CSRF bootstrap reports cookie presence without exposing the refresh token', async () => {
   const client = browser();
   assert.equal((await client.request('/auth/csrf')).hasSession, false);
