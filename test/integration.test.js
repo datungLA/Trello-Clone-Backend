@@ -67,6 +67,111 @@ async function account(name) {
   return Object.assign(client, { user });
 }
 
+test('private inbox capture, editing, full-set ordering and confirmed deletion stay owner-scoped', async () => {
+  const owner = await account('inbox-owner'), other = await account('inbox-other'), admin = await account('inbox-admin');
+  await pool.query("UPDATE users SET is_admin=true,app_role='admin' WHERE id=$1", [admin.user.id]);
+  try {
+    await browser().request('/inbox', { status: 401 });
+    assert.deepEqual(await owner.request('/inbox'), []);
+    const first = { id: randomUUID(), title: 'Capture an idea', description: 'Line one\n  Line two  ' };
+    const created = await owner.request('/inbox', { method: 'POST', status: 201, body: first });
+    assert.equal(created.description, first.description);
+    assert.equal(created.position, 0);
+    assert.deepEqual(await owner.request('/inbox', { method: 'POST', body: first }), created);
+    await owner.request('/inbox', { method: 'POST', status: 409, body: { ...first, title: 'Changed request' } });
+    await owner.request('/inbox', { method: 'POST', status: 400, body: { title: 'Missing stable ID' } });
+    for (const stranger of [other, admin]) {
+      assert.deepEqual(await stranger.request('/inbox'), []);
+      await stranger.request(`/inbox/${first.id}`, { method: 'PATCH', status: 404, body: { title: 'Not mine' } });
+      await stranger.request(`/inbox/${first.id}`, { method: 'DELETE', status: 404, body: { confirm: true } });
+      await stranger.request(`/inbox/${first.id}/move`, { method: 'POST', status: 404, body: { listId: randomUUID() } });
+      const conflict = await stranger.request('/inbox', { method: 'POST', status: 409, body: first });
+      assert.equal(JSON.stringify(conflict).includes(first.description), false);
+    }
+    await pool.query("UPDATE users SET app_role='super_admin' WHERE id=$1", [admin.user.id]);
+    assert.deepEqual(await admin.request('/inbox'), []);
+    await admin.request(`/inbox/${first.id}`, { method: 'PATCH', status: 404, body: { title: 'Still private' } });
+    const edited = await owner.request(`/inbox/${first.id}`, { method: 'PATCH', body: { title: 'Edited idea', description: '' } });
+    assert.equal(edited.title, 'Edited idea'); assert.equal(edited.description, '');
+    await owner.request('/inbox', { method: 'POST', status: 409, body: first });
+    await owner.request(`/inbox/${first.id}`, { method: 'PATCH', status: 400, body: { title: '' } });
+    await owner.request(`/inbox/${first.id}`, { method: 'PATCH', status: 400, body: { description: 'x'.repeat(10001) } });
+    const second = await owner.request('/inbox', { method: 'POST', status: 201, body: { id: randomUUID(), title: 'Second idea' } });
+    const third = await owner.request('/inbox', { method: 'POST', status: 201, body: { id: randomUUID(), title: 'Third idea' } });
+    const reordered = await owner.request('/inbox/reorder', { method: 'POST', body: { ids: [third.id, first.id, second.id] } });
+    assert.deepEqual(reordered.map(row => [row.id, row.position]), [[third.id, 0], [first.id, 1], [second.id, 2]]);
+    assert.deepEqual((await owner.request('/inbox')).map(row => row.id), [third.id, first.id, second.id]);
+    await owner.request('/inbox/reorder', { method: 'POST', status: 409, body: { ids: [first.id, second.id] } });
+    await owner.request('/inbox/reorder', { method: 'POST', status: 409, body: { ids: [first.id, second.id, randomUUID()] } });
+    await owner.request('/inbox/reorder', { method: 'POST', status: 400, body: { ids: [first.id, first.id, second.id] } });
+    await owner.request('/inbox/reorder', { method: 'POST', status: 400, body: { ids: [null] } });
+    await owner.request(`/inbox/${first.id}`, { method: 'DELETE', status: 400 });
+    await owner.request(`/inbox/${first.id}`, { method: 'DELETE', body: { confirm: true } });
+    await owner.request(`/inbox/${first.id}`, { method: 'DELETE', status: 404, body: { confirm: true } });
+    assert.deepEqual((await owner.request('/inbox')).map(row => row.id), [third.id, second.id]);
+  } finally { await pool.query("UPDATE users SET is_admin=false,app_role='user' WHERE id=$1", [admin.user.id]); }
+});
+
+test('inbox moves authorize current destinations and retry exactly once under concurrent requests', async () => {
+  const owner = await account('inbox-board-owner'), member = await account('inbox-member');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Inbox destinations' } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Capture board' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'To do' } });
+  const otherList = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'Later' } });
+  const capture = { id: randomUUID(), title: 'Preserve the whole idea', description: 'Detailed plan\nwith whitespace  ' };
+  await member.request('/inbox', { method: 'POST', status: 201, body: capture });
+  await member.request(`/inbox/${capture.id}/move`, { method: 'POST', status: 404, body: { listId: list.id } });
+  const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+  await owner.request(`/boards/${board.id}`, { method: 'PATCH', body: { closed: true } });
+  await member.request(`/inbox/${capture.id}/move`, { method: 'POST', status: 409, body: { listId: list.id } });
+  await owner.request(`/boards/${board.id}`, { method: 'PATCH', body: { closed: false } });
+  await owner.request(`/lists/${list.id}`, { method: 'PATCH', body: { archived: true } });
+  await member.request(`/inbox/${capture.id}/move`, { method: 'POST', status: 409, body: { listId: list.id } });
+  await owner.request(`/lists/${list.id}`, { method: 'PATCH', body: { archived: false } });
+  await pool.query('UPDATE workspaces SET archived=true WHERE id=$1', [workspace.id]);
+  await member.request(`/inbox/${capture.id}/move`, { method: 'POST', status: 409, body: { listId: list.id } });
+  await pool.query('UPDATE workspaces SET archived=false WHERE id=$1', [workspace.id]);
+  assert.equal((await member.request('/inbox')).length, 1);
+  const results = await Promise.all([member.request(`/inbox/${capture.id}/move`, { method: 'POST', body: { listId: list.id } }), member.request(`/inbox/${capture.id}/move`, { method: 'POST', body: { listId: list.id } })]);
+  assert.deepEqual(results[0], results[1]);
+  assert.deepEqual(Object.keys(results[0]).sort(), ['boardId', 'cardId', 'itemId', 'listId']);
+  const moved = await member.request(`/cards/${results[0].cardId}`);
+  assert.equal(moved.title, capture.title); assert.equal(moved.description, capture.description);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM cards WHERE list_id=$1 AND title=$2', [list.id, capture.title])).rows[0].count, 1);
+  assert.equal((await pool.query("SELECT count(*)::int AS count FROM activity WHERE card_id=$1 AND action='card.created'", [moved.id])).rows[0].count, 1);
+  assert.deepEqual(await member.request('/inbox'), []);
+  await member.request('/inbox', { method: 'POST', status: 409, body: capture });
+  await member.request(`/inbox/${capture.id}`, { method: 'PATCH', status: 409, body: { title: 'No duplicate edit' } });
+  await member.request(`/inbox/${capture.id}`, { method: 'DELETE', status: 409, body: { confirm: true } });
+  await member.request(`/inbox/${capture.id}/move`, { method: 'POST', status: 409, body: { listId: otherList.id } });
+  await owner.request(`/workspaces/${workspace.id}/members/${member.user.id}`, { method: 'DELETE' });
+  await member.request(`/inbox/${capture.id}/move`, { method: 'POST', status: 404, body: { listId: list.id } });
+  const fresh = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: fresh.token } });
+  assert.deepEqual(await member.request(`/inbox/${capture.id}/move`, { method: 'POST', body: { listId: list.id } }), results[0]);
+  await owner.request(`/cards/${moved.id}`, { method: 'PATCH', body: { archived: true } });
+  await member.request(`/inbox/${capture.id}/move`, { method: 'POST', status: 409, body: { listId: list.id } });
+  await owner.request(`/cards/${moved.id}`, { method: 'DELETE', body: { confirm: true } });
+  await member.request(`/inbox/${capture.id}/move`, { method: 'POST', status: 410, body: { listId: list.id } });
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM cards WHERE list_id=$1', [list.id])).rows[0].count, 0);
+});
+
+test('account deletion removes private inbox captures but preserves converted shared cards', async () => {
+  const owner = await account('inbox-retention-owner'), member = await account('inbox-retention-member');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Retained shared work' } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Shared board' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'To do' } });
+  const invitation = await owner.request(`/workspaces/${workspace.id}/invitations`, { method: 'POST', status: 201, body: { email: member.user.email } });
+  await member.request('/invitations/accept', { method: 'POST', body: { token: invitation.token } });
+  const converted = await member.request('/inbox', { method: 'POST', status: 201, body: { id: randomUUID(), title: 'Shared after capture', description: 'Keep this shared detail' } });
+  const moved = await member.request(`/inbox/${converted.id}/move`, { method: 'POST', body: { listId: list.id } });
+  await member.request('/inbox', { method: 'POST', status: 201, body: { id: randomUUID(), title: 'Private unpublished idea' } });
+  await member.request('/me', { method: 'DELETE', body: { confirm: 'DELETE', password: 'learning-password-123' } });
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM inbox_items WHERE user_id=$1', [member.user.id])).rows[0].count, 0);
+  assert.equal((await owner.request(`/cards/${moved.cardId}`)).description, 'Keep this shared detail');
+});
+
 test('system backup enforces super-admin scope, OAuth browser/session binding, encrypted tokens and verified uploads', async () => {
   const ordinary = await account('backup-ordinary'), admin = await account('backup-admin'), superAdmin = await account('backup-super');
   await pool.query("UPDATE users SET is_admin=true,app_role='admin' WHERE id=$1", [admin.user.id]);

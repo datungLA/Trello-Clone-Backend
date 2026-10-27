@@ -9,6 +9,7 @@ import { installAdmin, installArchiveGuard, workspaceActive } from './admin.js';
 import { installTaskManagement, cardExtras, cardDetails, editCardExtras, logActivity } from './tasks.js';
 import { installNotifications, notifyCard } from './notifications.js';
 import { createBackupService } from './backup.js';
+import { installInbox } from './inbox.js';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function id(value) {
@@ -302,6 +303,7 @@ export function createApp({ pool, redis, config }) {
     res.json(cardData(card));
   });
   installNotifications(app, { pool });
+  installInbox(app, { pool, id, listAccess, cardAccess });
   installAdmin(app, { pool, id, bool });
   backup.installRoutes(app);
   installTaskManagement(app, { pool, membership, boardAccess, listAccess, cardAccess, id, color, bool, position, cardData, listData, boardData });
