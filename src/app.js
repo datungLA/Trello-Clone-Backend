@@ -8,6 +8,7 @@ import { transaction } from './db.js';
 import { installAdmin, installArchiveGuard, workspaceActive } from './admin.js';
 import { installTaskManagement, cardExtras, cardDetails, editCardExtras, logActivity } from './tasks.js';
 import { installNotifications, notifyCard } from './notifications.js';
+import { createBackupService } from './backup.js';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function id(value) {
@@ -43,6 +44,9 @@ export function createApp({ pool, redis, config }) {
     res.json({ status: 'ok' });
   });
   const authenticate = installAuth(app, { pool, redis, config });
+  const backup = createBackupService({ pool, redis, config });
+  app.locals.backup = backup;
+  backup.installCallback(app);
   app.use('/api', authenticate);
   app.use('/api', (req, res, next) => {
     for (const part of req.path.split('/')) {
@@ -299,6 +303,7 @@ export function createApp({ pool, redis, config }) {
   });
   installNotifications(app, { pool });
   installAdmin(app, { pool, id, bool });
+  backup.installRoutes(app);
   installTaskManagement(app, { pool, membership, boardAccess, listAccess, cardAccess, id, color, bool, position, cardData, listData, boardData });
   app.use((req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }));
   app.use((error, req, res, next) => {

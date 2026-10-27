@@ -23,6 +23,12 @@ export function validateConfig(config) {
     if (url.origin !== origin || url.username || url.password || !['http:', 'https:'].includes(url.protocol)) throw new Error('Application origins must be exact HTTP(S) origins without paths.');
     if (config.nodeEnv === 'production' && url.protocol !== 'https:') throw new Error('Production requires HTTPS application origins.');
   }
+  if (config.backup) {
+    const backup = config.backup;
+    if (backup.origin && !origins.includes(backup.origin)) throw new Error('BACKUP_ORIGIN must be an exact configured application origin.');
+    if (backup.environment && !/^[a-z][a-z0-9-]{0,31}$/.test(backup.environment)) throw new Error('BACKUP_ENVIRONMENT must be a short lowercase environment name.');
+    if (backup.tokenKey && !/^[a-f0-9]{64}$/i.test(backup.tokenKey)) throw new Error('BACKUP_TOKEN_KEY must be 32 random bytes in hexadecimal.');
+  }
   if (config.nodeEnv === 'production') {
     if (!config.secure) throw new Error('Production requires secure cookies.');
     if (!config.trustProxy) throw new Error('Production requires bounded TRUST_PROXY.');

@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile, mkdir, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createClient } from 'redis';
@@ -11,6 +11,7 @@ import { createApp } from '../src/app.js';
 import { hash } from '../src/auth.js';
 import { grantAdministrator } from '../src/bootstrap-admin.js';
 import { boundedMailQueue } from '../src/mail.js';
+import { encryptBackupToken } from '../src/backup.js';
 
 if (!process.env.TEST_DATABASE_URL) throw new Error('TEST_DATABASE_URL is required; use a disposable test database.');
 const pool = database(process.env.TEST_DATABASE_URL);
@@ -65,6 +66,121 @@ async function account(name) {
   const user = (await client.request('/auth/login', { method: 'POST', body: { email: address, password: 'learning-password-123' } })).user;
   return Object.assign(client, { user });
 }
+
+test('system backup enforces super-admin scope, OAuth browser/session binding, encrypted tokens and verified uploads', async () => {
+  const ordinary = await account('backup-ordinary'), admin = await account('backup-admin'), superAdmin = await account('backup-super');
+  await pool.query("UPDATE users SET is_admin=true,app_role='admin' WHERE id=$1", [admin.user.id]);
+  await pool.query("UPDATE users SET is_admin=true,app_role='super_admin' WHERE id=$1", [superAdmin.user.id]);
+  const key = 'ab'.repeat(32), digest = 'test-checksum';
+  let uploadCount = 0, retentionCount = 0, failUpload = false, releaseRetention, enteredRetention;
+  const retentionEntered = new Promise(resolve => { enteredRetention = resolve; });
+  const backupConfig = {
+    clientId: 'test-client.apps.googleusercontent.com', clientSecret: 'test-client-secret', tokenKey: key,
+    environment: 'test', origin: 'http://localhost:8080', recipientCertFile: mailDir, configDir: mailDir, workDir: mailDir,
+    async fetch(url, options = {}) {
+      const value = String(url), json = body => new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } });
+      if (value === 'https://oauth2.googleapis.com/token') return json({ access_token: 'access-private', refresh_token: 'refresh-private', scope: 'https://www.googleapis.com/auth/drive.file' });
+      if (value.includes('/oauth2/v2/userinfo')) return json({ email: 'backup-owner@example.com' });
+      if (value.includes('uploadType=resumable')) return new Response(null, { headers: { location: 'https://www.googleapis.com/upload/drive/v3/files?upload_id=test' } });
+      if (value.includes('upload_id=test')) { for await (const chunk of options.body) assert.ok(chunk.length); if (failUpload) return new Response(null, { status: 503 }); uploadCount++; return json({ id: 'file-id' }); }
+      if (value.includes('/files/file-id')) return json({ id: 'file-id', size: '9', md5Checksum: digest, trashed: false });
+      if (options.method === 'POST' && value.startsWith('https://www.googleapis.com/drive/v3/files')) return json({ id: 'folder-id' });
+      if (value.includes('/files/folder-id')) return json({ id: 'folder-id', trashed: false, appProperties: { namespace: (await pool.query('SELECT namespace FROM backup_settings')).rows[0].namespace } });
+      if (value.includes('/files?')) { retentionCount++; enteredRetention(); await new Promise(resolve => { releaseRetention = resolve; }); return json({ files: [] }); }
+      throw new Error('Unexpected Google request');
+    },
+    async archive({ directory }) {
+      const path = join(directory, 'backup.cms');
+      await writeFile(path, 'encrypted');
+      return { path, size: 9, checksum: digest };
+    },
+  };
+  const app = createApp({ pool, redis, config: { jwtSecret: 'test-secret-with-more-than-thirty-two-characters', origin: 'http://localhost:8080', secure: false, nodeEnv: 'test', authRateLimit: false, backup: backupConfig } });
+  const backupServer = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => backupServer.once('listening', resolve));
+  const backupBase = `http://127.0.0.1:${backupServer.address().port}/api`;
+  const client = browser(backupBase); client.token = superAdmin.token;
+  try {
+    await browser(backupBase).request('/admin/backup/settings', { status: 401 });
+    for (const denied of [ordinary, admin]) {
+      const actor = browser(backupBase); actor.token = denied.token;
+      await actor.request('/admin/backup/settings', { status: 403 });
+      await actor.request('/admin/backup/run', { method: 'POST', status: 403 });
+    }
+    const settings = await client.request('/admin/backup/settings');
+    assert.equal(settings.redirectUri, 'http://localhost:8080/api/backup/oauth/callback');
+    assert.equal(settings.connected, false);
+    assert.equal(settings.configured, true);
+    await client.request('/admin/backup/run', { method: 'POST', status: 503 });
+    const oauth = await client.request('/admin/backup/gdrive/oauth/start', { method: 'POST' });
+    const authUrl = new URL(oauth.authUrl), state = authUrl.searchParams.get('state');
+    assert.equal(authUrl.searchParams.get('code_challenge_method'), 'S256');
+    assert.ok(authUrl.searchParams.get('scope').includes('drive.file'));
+    const callback = async (value, cookies = client.cookies) => fetch(`${backupBase}/backup/oauth/callback?state=${value}&code=test-code`, { redirect: 'manual', headers: { Cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join('; ') } });
+    const connected = await callback(state);
+    assert.equal(connected.status, 303);
+    assert.ok(connected.headers.get('location').endsWith('backupConnection=connected'));
+    assert.ok((await callback(state)).headers.get('location').endsWith('backupConnection=failed'));
+    const row = (await pool.query('SELECT token_ciphertext FROM backup_settings')).rows[0];
+    assert.equal(row.token_ciphertext.includes('refresh-private'), false);
+    const publicValue = await client.request('/admin/backup/settings');
+    assert.equal(publicValue.connected, true);
+    assert.equal(JSON.stringify(publicValue).includes('refresh-private'), false);
+    await client.request('/admin/backup/settings', { method: 'PUT', body: { ...publicValue, remoteFolder: '../escape' }, status: 400 });
+    await client.request('/admin/backup/settings', { method: 'PUT', body: { ...publicValue, enabled: true } });
+    const run = await client.request('/admin/backup/run', { method: 'POST', status: 202 });
+    await Promise.race([retentionEntered, new Promise((resolve, reject) => setTimeout(() => reject(new Error('Retention was not reached')), 3000))]);
+    assert.equal((await client.request(`/admin/backup/runs/${run.id}`)).status, 'running');
+    await client.request('/admin/backup/run', { method: 'POST', status: 409 });
+    await client.request('/admin/backup/gdrive/disconnect', { method: 'POST', body: { confirm: true }, status: 409 });
+    releaseRetention();
+    let completed;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      completed = await client.request(`/admin/backup/runs/${run.id}`);
+      if (['success', 'failed'].includes(completed.status)) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(completed.status, 'success', completed.error);
+    assert.equal(completed.checksum, digest);
+    assert.ok(completed.verifiedAt);
+    assert.equal(uploadCount, 1);
+    assert.equal((await client.request('/admin/backup/runs')).items[0].id, run.id);
+    failUpload = true;
+    const failed = await client.request('/admin/backup/run', { method: 'POST', status: 202 });
+    for (let attempt = 0; attempt < 100; attempt++) {
+      completed = await client.request(`/admin/backup/runs/${failed.id}`);
+      if (completed.status === 'failed') break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(completed.status, 'failed');
+    assert.equal(retentionCount, 1, 'failed uploads must not trigger retention');
+    assert.equal((await readdir(mailDir)).some(name => name.startsWith(`run-${failed.id}-`)), false);
+    const staleId = randomUUID(), staleDir = join(mailDir, `run-${staleId}-orphan`), finishedDir = join(mailDir, `run-${run.id}-orphan`);
+    await mkdir(staleDir); await mkdir(finishedDir);
+    await writeFile(join(staleDir, 'private.sql'), 'must be removed');
+    await pool.query("INSERT INTO backup_runs(id,kind,status,scope_db,scope_configs,settings,heartbeat_at) VALUES($1,'manual','running',true,true,'{}',now()-interval '5 minutes')", [staleId]);
+    await app.locals.backup.start();
+    await assert.rejects(access(staleDir)); await assert.rejects(access(finishedDir));
+    assert.equal((await client.request(`/admin/backup/runs/${staleId}`)).status, 'failed');
+    await client.request('/admin/backup/gdrive/disconnect', { method: 'POST', status: 400 });
+    const disconnected = await client.request('/admin/backup/gdrive/disconnect', { method: 'POST', body: { confirm: true } });
+    assert.equal(disconnected.connected, false);
+    assert.equal(disconnected.enabled, false);
+    const second = await client.request('/admin/backup/gdrive/oauth/start', { method: 'POST' });
+    assert.ok((await callback(new URL(second.authUrl).searchParams.get('state'), new Map())).headers.get('location').endsWith('backupConnection=failed'));
+    await pool.query('UPDATE backup_settings SET token_ciphertext=$1 WHERE id=true', [encryptBackupToken({ refresh_token: 'test' }, key)]);
+    const revoked = await client.request('/admin/backup/gdrive/oauth/start', { method: 'POST' });
+    await pool.query('UPDATE refresh_tokens SET revoked=true WHERE user_id=$1', [superAdmin.user.id]);
+    assert.ok((await callback(new URL(revoked.authUrl).searchParams.get('state'))).headers.get('location').endsWith('backupConnection=failed'));
+  } finally {
+    releaseRetention?.();
+    await app.locals.backup.stop();
+    await new Promise(resolve => backupServer.close(resolve));
+    await pool.query('DELETE FROM backup_runs');
+    await pool.query("UPDATE backup_settings SET enabled=false,token_ciphertext=NULL,account_email='',folder_id=NULL,last_slot=NULL");
+    await pool.query("UPDATE users SET is_admin=false,app_role='user' WHERE id=ANY($1::uuid[])", [[admin.user.id, superAdmin.user.id]]);
+  }
+});
 
 test('my tasks follows assignment and current membership across active workspaces', async () => {
   const owner = await account('my-tasks-owner');
