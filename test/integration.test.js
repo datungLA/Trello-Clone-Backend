@@ -67,6 +67,80 @@ async function account(name) {
   return Object.assign(client, { user });
 }
 
+test('private planner preserves identities, rejects stale edits and never grants administrator bypass', async () => {
+  const owner = await account('planner-owner'), other = await account('planner-other'), admin = await account('planner-admin');
+  await pool.query("UPDATE users SET is_admin=true,app_role='super_admin' WHERE id=$1", [admin.user.id]);
+  const range = '/planner?from=2026-10-27T00:00:00Z&to=2026-10-28T00:00:00Z';
+  const body = { id: randomUUID(), title: 'Focus on one thing', notes: 'First line\n  Keep spacing  ', startsAt: '2026-10-27T09:00:00-07:00', endsAt: '2026-10-27T10:00:00-07:00' };
+  try {
+    await browser().request(range, { status: 401 });
+    const created = await owner.request('/planner', { method: 'POST', status: 201, body });
+    assert.equal(created.revision, 1); assert.equal(created.notes, body.notes);
+    assert.equal(created.startsAt, '2026-10-27T16:00:00.000Z');
+    assert.deepEqual(await owner.request('/planner', { method: 'POST', body }), created);
+    await owner.request('/planner', { method: 'POST', status: 409, body: { ...body, title: 'Changed capture' } });
+    for (const stranger of [other, admin]) {
+      assert.deepEqual(await stranger.request(range), []);
+      await stranger.request(`/planner/${created.id}`, { method: 'PATCH', status: 404, body: { ...body, revision: 1 } });
+      await stranger.request(`/planner/${created.id}`, { method: 'DELETE', status: 404, body: { confirm: true, revision: 1 } });
+      const denied = await stranger.request('/planner', { method: 'POST', status: 409, body });
+      assert.equal(JSON.stringify(denied).includes(body.notes), false);
+    }
+    await owner.request(`/planner/${created.id}`, { method: 'PATCH', status: 400, body });
+    await owner.request(`/planner/${created.id}`, { method: 'PATCH', status: 400, body: { ...body, revision: 1.5 } });
+    const responses = await Promise.all(['First session', 'Second session'].map(async title => {
+      const response = await fetch(`${base}/planner/${created.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Origin: 'http://localhost:8080', Authorization: `Bearer ${owner.token}` }, body: JSON.stringify({ ...body, title, revision: 1 }) });
+      return { status: response.status, data: await response.json() };
+    }));
+    assert.deepEqual(responses.map(response => response.status).sort(), [200, 409]);
+    const edited = responses.find(response => response.status === 200).data;
+    assert.equal(edited.revision, 2); assert.equal(edited.notes, body.notes);
+    assert.equal((await owner.request(range))[0].revision, 2);
+    await owner.request(`/planner/${created.id}`, { method: 'DELETE', status: 400, body: { revision: 2 } });
+    await owner.request(`/planner/${created.id}`, { method: 'DELETE', status: 409, body: { confirm: true, revision: 1 } });
+    await owner.request(`/planner/${created.id}`, { method: 'DELETE', body: { confirm: true, revision: 2 } });
+    assert.deepEqual(await owner.request(range), []);
+    await owner.request('/planner', { method: 'POST', status: 409, body });
+    await owner.request(`/planner/${created.id}`, { method: 'PATCH', status: 409, body: { ...body, revision: 2 } });
+    await owner.request(`/planner/${created.id}`, { method: 'DELETE', status: 409, body: { confirm: true, revision: 2 } });
+    const tombstone = (await pool.query('SELECT deleted_at,revision FROM planner_blocks WHERE id=$1', [created.id])).rows[0];
+    assert.ok(tombstone.deleted_at); assert.equal(tombstone.revision, 3);
+  } finally { await pool.query("UPDATE users SET is_admin=false,app_role='user' WHERE id=$1", [admin.user.id]); }
+});
+
+test('planner queries use chronological overlap boundaries and never alter task due dates', async () => {
+  const owner = await account('planner-range-owner');
+  const workspace = await owner.request('/workspaces', { method: 'POST', status: 201, body: { name: 'Separate task dates' } });
+  const board = await owner.request(`/workspaces/${workspace.id}/boards`, { method: 'POST', status: 201, body: { title: 'Tasks' } });
+  const list = await owner.request(`/boards/${board.id}/lists`, { method: 'POST', status: 201, body: { title: 'To do' } });
+  const card = await owner.request(`/lists/${list.id}/cards`, { method: 'POST', status: 201, body: { title: 'Due tomorrow' } });
+  const dated = await owner.request(`/cards/${card.id}`, { method: 'PATCH', body: { startDate: '2026-10-27', dueDate: '2026-10-28' } });
+  const add = async (title, start, end) => owner.request('/planner', { method: 'POST', status: 201, body: { id: randomUUID(), title, notes: '', startsAt: `2026-10-27T${start}:00Z`, endsAt: `2026-10-27T${end}:00Z`, cardId: card.id } });
+  const before = await add('Ends at range start', '09:00', '10:00');
+  const spanningStart = await add('Spans start', '09:30', '10:30');
+  const longer = await add('Longer same-start block', '10:00', '11:00');
+  const shorter = await add('Shorter same-start block', '10:00', '10:30');
+  const spanningEnd = await add('Spans end', '11:30', '12:30');
+  const after = await add('Starts at range end', '12:00', '13:00');
+  const blocks = await owner.request('/planner?from=2026-10-27T10:00:00Z&to=2026-10-27T12:00:00Z');
+  assert.deepEqual(blocks.map(block => block.id), [spanningStart.id, shorter.id, longer.id, spanningEnd.id]);
+  assert.equal(blocks.some(block => [before.id, after.id].includes(block.id)), false);
+  for (const query of ['/planner', '/planner?from=2026-10-27T10:00:00&to=2026-10-28T10:00:00Z', '/planner?from=2026-10-27T10:00:00Z&to=2026-10-27T09:00:00Z', '/planner?from=2026-01-01T00:00Z&to=2026-04-01T00:00Z', '/planner?from=x&from=y&to=2026-10-27T12:00Z']) await owner.request(query, { status: 400 });
+  await owner.request('/planner', { method: 'POST', status: 400, body: { id: randomUUID(), title: 'Overflow date', startsAt: '2026-02-30T10:00Z', endsAt: '2026-03-02T10:00Z' } });
+  const unchanged = await owner.request(`/cards/${card.id}`);
+  assert.equal(unchanged.startDate, dated.startDate); assert.equal(unchanged.dueDate, dated.dueDate);
+});
+
+test('planner account deletion removes active and deleted private blocks', async () => {
+  const owner = await account('planner-delete-owner');
+  const body = { title: 'Private focus', notes: 'Personal notes', startsAt: '2026-10-27T10:00Z', endsAt: '2026-10-27T11:00Z' };
+  const active = await owner.request('/planner', { method: 'POST', status: 201, body: { ...body, id: randomUUID() } });
+  const removed = await owner.request('/planner', { method: 'POST', status: 201, body: { ...body, id: randomUUID() } });
+  await owner.request(`/planner/${removed.id}`, { method: 'DELETE', body: { confirm: true, revision: 1 } });
+  await owner.request('/me', { method: 'DELETE', body: { confirm: 'DELETE', password: 'learning-password-123' } });
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM planner_blocks WHERE id=ANY($1::uuid[])', [[active.id, removed.id]])).rows[0].count, 0);
+});
+
 test('private inbox capture, editing, full-set ordering and confirmed deletion stay owner-scoped', async () => {
   const owner = await account('inbox-owner'), other = await account('inbox-other'), admin = await account('inbox-admin');
   await pool.query("UPDATE users SET is_admin=true,app_role='admin' WHERE id=$1", [admin.user.id]);
